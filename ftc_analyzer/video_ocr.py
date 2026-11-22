@@ -203,7 +203,7 @@ def _ocr_team_numbers_by_side(image_path: str,
             # A team ID is usually one OCR token; roster validation handles
             # occasional OCR confusion without admitting scores/timers.
             digits = re.sub(r"[^0-9]", "", token)
-            if not re.fullmatch(r"\\d{3,6}", digits):
+            if not re.fullmatch(r"\d{3,6}", digits):
                 continue
             number = int(digits)
             if roster is not None and number not in roster:
