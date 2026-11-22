@@ -93,26 +93,32 @@ def format_timestamp(seconds: int | float) -> str:
 
 
 def _ocr_text(image_path: str) -> tuple[str, float]:
+    """Read match/event text only from the top and bottom banner search bands."""
     image = Image.open(image_path).convert("RGB")
-    # Upscale smaller frames slightly; OCR works better on small overlay text.
-    if image.width < 1000:
-        scale = 1000 / image.width
-        image = image.resize((1000, int(image.height * scale)))
-    data = pytesseract.image_to_data(image, config="--psm 11", output_type=Output.DICT)
+    width, height = image.size
+    band_height = max(1, int(height * 0.25))
+    regions = [
+        image.crop((0, 0, width, band_height)),
+        image.crop((0, height - band_height, width, height)),
+    ]
     words, confidences = [], []
-    for word, conf in zip(data.get("text", []), data.get("conf", [])):
-        word = word.strip()
-        try:
-            confidence = float(conf)
-        except (TypeError, ValueError):
-            confidence = -1
-        if word:
-            words.append(word)
-        if confidence >= 0:
-            confidences.append(confidence)
+    for crop in regions:
+        if crop.width < 1000:
+            scale = 1000 / crop.width
+            crop = crop.resize((1000, int(crop.height * scale)))
+        data = pytesseract.image_to_data(crop, config="--psm 11", output_type=Output.DICT)
+        for word, conf in zip(data.get("text", []), data.get("conf", [])):
+            word = word.strip()
+            try:
+                confidence = float(conf)
+            except (TypeError, ValueError):
+                confidence = -1
+            if word:
+                words.append(word)
+            if confidence >= 0:
+                confidences.append(confidence)
     average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
     return " ".join(words), average
-
 
 MATCH_PATTERNS = [
     re.compile(r"\b(?:qualification|qualifying|qual|q)\s*(?:match\s*)?(?:no\.?\s*)?(\d{1,3})\b", re.I),
@@ -143,23 +149,116 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
     return sorted(digits)
 
 
+def _ocr_team_numbers_by_side(image_path: str,
+                              known_team_numbers: Iterable[int] | None = None
+                              ) -> tuple[list[int], list[int], str, float]:
+    """OCR only the top and bottom banner zones, then split by left/right.
+
+    FTC broadcast scoreboards may be at the top or bottom, but the central
+    portion of the frame is normally gameplay. Scanning only these edge bands
+    reduces OCR noise from robots, field labels, jerseys, and audience signs.
+    """
+    import numpy as np
+
+    image = Image.open(image_path).convert("RGB")
+    frame_width, frame_height = image.size
+    band_height = max(1, int(frame_height * 0.25))
+    # The banner is typically about 20% of the frame. A 25% search band gives
+    # some tolerance for different overlay heights and vertical placement.
+    regions = [
+        ("top", image.crop((0, 0, frame_width, band_height))),
+        ("bottom", image.crop((0, frame_height - band_height, frame_width, frame_height))),
+    ]
+    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
+    candidates = []
+    raw_words = []
+    confidences = []
+
+    for region_name, crop in regions:
+        scale = max(1.0, 1600 / crop.width)
+        if scale > 1:
+            crop = crop.resize((1600, int(crop.height * scale)))
+        gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        config = "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
+        data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
+        scale_x = crop.width / frame_width
+
+        for i, token in enumerate(data.get("text", [])):
+            token = token.strip()
+            try:
+                confidence = float(data["conf"][i])
+                left = float(data["left"][i])
+                width = float(data["width"][i])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not token:
+                continue
+            raw_words.append(token)
+            if confidence >= 0:
+                confidences.append(confidence)
+            if confidence < 25:
+                continue
+
+            # A team ID is usually one OCR token; roster validation handles
+            # occasional OCR confusion without admitting scores/timers.
+            digits = re.sub(r"[^0-9]", "", token)
+            if not re.fullmatch(r"\d{3,6}", digits):
+                continue
+            number = int(digits)
+            if roster is not None and number not in roster:
+                continue
+
+            center_x = (left + width / 2) / scale_x
+            side = "red" if center_x < frame_width / 2 else "blue"
+            candidates.append({
+                "number": number,
+                "side": side,
+                "confidence": confidence,
+                "region": region_name,
+            })
+
+    def select_side(side: str) -> list[int]:
+        side_items = sorted(
+            (c for c in candidates if c["side"] == side),
+            key=lambda c: c["confidence"],
+            reverse=True,
+        )
+        selected = []
+        for item in side_items:
+            if item["number"] not in selected:
+                selected.append(item["number"])
+            if len(selected) == 2:
+                break
+        return selected
+
+    average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
+    return select_side("red"), select_side("blue"), " ".join(raw_words), average
+
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
     results = []
     total = len(frame_rows)
     for index, frame in enumerate(frame_rows, start=1):
         text, confidence = _ocr_text(frame["frame_path"])
+        red_teams, blue_teams, team_raw, team_conf = _ocr_team_numbers_by_side(
+            frame["frame_path"], known_team_numbers
+        )
+        alliance_teams = sorted(set(red_teams + blue_teams))
         results.append({
             **frame,
             "ocr_text": text,
             "ocr_confidence": confidence,
             "match_number_candidate": detect_match_number(text),
-            "team_number_candidates": detect_team_numbers(text, known_team_numbers),
+            "red_team_numbers": red_teams,
+            "blue_team_numbers": blue_teams,
+            "team_number_ocr": team_raw,
+            "team_number_ocr_confidence": team_conf,
+            "team_number_candidates": alliance_teams,
         })
         if progress_callback:
             progress_callback(index / total, index, total)
     return results
-
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
     """Group consecutive frames with the same detected match number.
