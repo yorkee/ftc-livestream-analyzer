@@ -180,7 +180,7 @@ ocr_rows = st.session_state.ocr_rows
 if ocr_rows:
     st.subheader("OCR results")
     ocr_df = pd.DataFrame(ocr_rows)
-    display_columns = ["timestamp", "ocr_confidence", "match_number_candidate", "team_number_candidates", "ocr_text"]
+    display_columns = ["timestamp", "match_number_candidate", "red_team_numbers", "blue_team_numbers", "red_panel_confidence", "blue_panel_confidence", "team_number_candidates", "ocr_text"]
     st.dataframe(ocr_df[display_columns], use_container_width=True, height=420)
     st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
                        file_name="ftc_ocr_results.csv", mime="text/csv")
