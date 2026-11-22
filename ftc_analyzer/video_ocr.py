@@ -143,18 +143,80 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
     return sorted(digits)
 
 
+def _ocr_team_panel(image_path: str, alliance: str) -> tuple[list[int], str, float]:
+    """Read the two team-number cards from one alliance's scoreboard panel.
+
+    The current template targets the FTC Canopy-style 16:9 overlay shown in the
+    Saline Preview sample. Coordinates are proportional, so 720p and 1080p
+    frames use the same crop. Other overlay layouts will need another template.
+    """
+    image = Image.open(image_path).convert("RGB")
+    width, height = image.size
+    # Team-number cards sit in the lower scoreboard strip, left of each
+    # alliance's score. Keep each alliance isolated to avoid cross-reading.
+    regions = {
+        "red": (0.235, 0.845, 0.333, 1.0),
+        "blue": (0.667, 0.845, 0.765, 1.0),
+    }
+    if alliance not in regions:
+        raise ValueError("alliance must be 'red' or 'blue'")
+    left, top, right, bottom = regions[alliance]
+    crop = image.crop((int(left * width), int(top * height),
+                       int(right * width), int(bottom * height)))
+    # Enlarge the relatively small cards, then use a high-contrast grayscale
+    # image. Tesseract is constrained to digits to reduce icon/score noise.
+    crop = crop.resize((crop.width * 4, crop.height * 4))
+    import numpy as np
+    gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+    config = "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789"
+    data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
+    words, confidences = [], []
+    for word, conf in zip(data.get("text", []), data.get("conf", [])):
+        word = word.strip()
+        try:
+            score = float(conf)
+        except (TypeError, ValueError):
+            score = -1
+        if word:
+            words.append(word)
+        if score >= 0:
+            confidences.append(score)
+    raw = " ".join(words)
+    numbers = []
+    for value in re.findall(r"(?<!\\d)(\\d{3,6})(?!\\d)", raw):
+        number = int(value)
+        if number not in numbers:
+            numbers.append(number)
+    average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
+    return numbers[:2], raw, average
+
+
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
     results = []
     total = len(frame_rows)
+    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
     for index, frame in enumerate(frame_rows, start=1):
         text, confidence = _ocr_text(frame["frame_path"])
+        red_teams, red_raw, red_conf = _ocr_team_panel(frame["frame_path"], "red")
+        blue_teams, blue_raw, blue_conf = _ocr_team_panel(frame["frame_path"], "blue")
+        if roster is not None:
+            red_teams = [n for n in red_teams if n in roster]
+            blue_teams = [n for n in blue_teams if n in roster]
+        alliance_teams = sorted(set(red_teams + blue_teams))
         results.append({
             **frame,
             "ocr_text": text,
             "ocr_confidence": confidence,
             "match_number_candidate": detect_match_number(text),
-            "team_number_candidates": detect_team_numbers(text, known_team_numbers),
+            "red_team_numbers": red_teams,
+            "blue_team_numbers": blue_teams,
+            "red_panel_ocr": red_raw,
+            "blue_panel_ocr": blue_raw,
+            "red_panel_confidence": red_conf,
+            "blue_panel_confidence": blue_conf,
+            "team_number_candidates": alliance_teams,
         })
         if progress_callback:
             progress_callback(index / total, index, total)
