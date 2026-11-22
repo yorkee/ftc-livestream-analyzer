@@ -146,71 +146,78 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
 def _ocr_team_numbers_by_side(image_path: str,
                               known_team_numbers: Iterable[int] | None = None
                               ) -> tuple[list[int], list[int], str, float]:
-    """Find team-number OCR tokens anywhere in the frame and assign by x position.
+    """OCR only the top and bottom banner zones, then split by left/right.
 
-    This intentionally does not assume a fixed scoreboard location or vertical
-    orientation. FTC overlays vary, but the red alliance is on the left and
-    blue alliance is on the right. When a FIRST event roster is supplied, exact
-    roster matches are used to reject scores, timers, and unrelated numbers.
+    FTC broadcast scoreboards may be at the top or bottom, but the central
+    portion of the frame is normally gameplay. Scanning only these edge bands
+    reduces OCR noise from robots, field labels, jerseys, and audience signs.
     """
     import numpy as np
 
     image = Image.open(image_path).convert("RGB")
-    original_width = image.width
-    # Upscale to help read small broadcast overlays while preserving coordinates.
-    if image.width < 1600:
-        scale = 1600 / image.width
-        image = image.resize((1600, int(image.height * scale)))
-    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    config = "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
-    data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
-
+    frame_width, frame_height = image.size
+    band_height = max(1, int(frame_height * 0.25))
+    # The banner is typically about 20% of the frame. A 25% search band gives
+    # some tolerance for different overlay heights and vertical placement.
+    regions = [
+        ("top", image.crop((0, 0, frame_width, band_height))),
+        ("bottom", image.crop((0, frame_height - band_height, frame_width, frame_height))),
+    ]
     roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
     candidates = []
     raw_words = []
     confidences = []
-    scale_x = image.width / original_width
-    for i, token in enumerate(data.get("text", [])):
-        token = token.strip()
-        try:
-            confidence = float(data["conf"][i])
-            left = float(data["left"][i])
-            top = float(data["top"][i])
-            width = float(data["width"][i])
-            height = float(data["height"][i])
-        except (TypeError, ValueError, KeyError):
-            continue
-        if not token:
-            continue
-        raw_words.append(token)
-        if confidence >= 0:
-            confidences.append(confidence)
 
-        # OCR sometimes inserts punctuation or spaces into a team number.
-        digit_runs = re.findall(r"(?<!\\d)(\\d{3,6})(?!\\d)", token)
-        for digits in digit_runs:
+    for region_name, crop in regions:
+        scale = max(1.0, 1600 / crop.width)
+        if scale > 1:
+            crop = crop.resize((1600, int(crop.height * scale)))
+        gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        config = "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
+        data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
+        scale_x = crop.width / frame_width
+
+        for i, token in enumerate(data.get("text", [])):
+            token = token.strip()
+            try:
+                confidence = float(data["conf"][i])
+                left = float(data["left"][i])
+                width = float(data["width"][i])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not token:
+                continue
+            raw_words.append(token)
+            if confidence >= 0:
+                confidences.append(confidence)
+            if confidence < 25:
+                continue
+
+            # A team ID is usually one OCR token; roster validation handles
+            # occasional OCR confusion without admitting scores/timers.
+            digits = re.sub(r"[^0-9]", "", token)
+            if not re.fullmatch(r"\\d{3,6}", digits):
+                continue
             number = int(digits)
             if roster is not None and number not in roster:
                 continue
-            if confidence < 25:
-                continue
+
             center_x = (left + width / 2) / scale_x
-            center_y = (top + height / 2) / scale_x
+            side = "red" if center_x < frame_width / 2 else "blue"
             candidates.append({
                 "number": number,
-                "x": center_x,
-                "y": center_y,
+                "side": side,
                 "confidence": confidence,
+                "region": region_name,
             })
 
-    # Prefer high-confidence detections and avoid duplicate readings of a card.
-    # Two unique team numbers per side are expected in a standard FTC match.
     def select_side(side: str) -> list[int]:
-        midpoint = original_width / 2
-        side_items = [c for c in candidates
-                      if (c["x"] < midpoint if side == "red" else c["x"] >= midpoint)]
-        side_items.sort(key=lambda c: c["confidence"], reverse=True)
+        side_items = sorted(
+            (c for c in candidates if c["side"] == side),
+            key=lambda c: c["confidence"],
+            reverse=True,
+        )
         selected = []
         for item in side_items:
             if item["number"] not in selected:
@@ -221,7 +228,6 @@ def _ocr_team_numbers_by_side(image_path: str,
 
     average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
     return select_side("red"), select_side("blue"), " ".join(raw_words), average
-
 
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
