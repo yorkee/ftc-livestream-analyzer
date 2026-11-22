@@ -1,61 +1,67 @@
-# FTC Livestream Analyzer (local MVP)
+# FTC Livestream Analyzer — video OCR MVP
 
-## What it does
-- Accepts an archived YouTube URL.
-- Uses yt-dlp + FFmpeg to extract an MP3 audio track.
-- Uses faster-whisper to transcribe speech locally.
-- Detects explicit spoken match-number mentions.
-- Fetches the FIRST FTC hybrid schedule for a season/event/tournament level.
-- Maps detected match numbers to the teams in FIRST's schedule.
-- Produces YouTube `?t=...s` links and CSV/JSON exports.
+## What this version does
+- Accepts an archived YouTube livestream URL.
+- Downloads a video stream (no audio extraction or transcription).
+- Uses FFmpeg to capture one frame every 10 seconds by default; 5, 15, and 30 seconds are configurable.
+- Runs Tesseract OCR on every captured frame.
+- Attempts to recognize match-number labels and event team numbers from OCR text.
+- Optionally fetches the FIRST hybrid schedule to filter team-number candidates against the event roster.
+- Groups consecutive frames that show the same match number into **observed scoreboard windows**.
+- Saves frame images and OCR results locally and provides CSV/JSON exports.
 
-**Important:** This first version does not yet use visual scoreboard OCR. A spoken match mention is only a candidate timestamp and should be checked against the video. FIRST schedule times are not used to invent video timestamps.
+**Important:** This is an OCR prototype, not yet a verified match-boundary detector. A scoreboard can show the next match before play begins or continue showing a match after play ends. The reported first/last observations are not exact match start/end times. We will add match-state/clock transition detection after validating OCR against a real event stream.
 
-## Requirements
-- Ubuntu/Linux
-- Python 3.11 or 3.12 recommended
-- FFmpeg installed and available on PATH
-- Internet access for YouTube retrieval, Whisper model download, and FIRST API calls
-
-Install FFmpeg if needed:
+## System requirements (Ubuntu)
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg
+sudo apt install -y ffmpeg tesseract-ocr python3-venv python3-full
 ```
 
 ## Setup
+Use the Python version available on your system. A virtual environment prevents Ubuntu's externally-managed Python restriction:
 ```bash
-cd ~/ftc-livestream-analyzer
-python -m venv .venv
+cd ~/workspace/ftc-livestream-analyzer
+python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and add your FIRST API username and authorization key. You can also enter these in the app sidebar. Do not commit or share `.env`.
+Edit `.env` with your FIRST API username and authorization key, or enter them in the app sidebar. Do not commit or share `.env`.
 
-Get FIRST API credentials:
-https://ftc-events.firstinspires.org/services/API/register
+FIRST API credentials: https://ftc-events.firstinspires.org/services/API/register
 
 ## Run
 ```bash
+cd ~/workspace/ftc-livestream-analyzer
+source .venv/bin/activate
 streamlit run app.py
 ```
 Open http://localhost:8501
 
 ## Workflow
-1. Paste the YouTube archive URL and click **Inspect YouTube video**.
-2. Enter season, FIRST event code, and tournament level (`qual` or `playoff`).
-3. Enter FIRST API username/key in the sidebar.
-4. Click **Extract audio + transcribe**.
-5. Click **Detect matches + fetch FIRST schedule**.
-6. Review/export the CSV or JSON.
+1. Paste the archived YouTube URL and click **Inspect YouTube video**.
+2. Enter the season, FIRST event code, and tournament level (`qual` or `playoff`).
+3. Set frame interval to 10 seconds (default).
+4. Click **Download video + capture frames**.
+5. Review the frame previews to make sure the scoreboard is visible.
+6. Click **Run OCR on captured frames**.
+7. Review OCR text, match-number candidates, team-number candidates, and observed match windows. Export CSV/JSON as needed.
 
-## Notes
-- First Whisper run downloads its model. `small` is a reasonable starting point; `base` is faster, `medium` may improve accuracy but needs more compute.
-- Processing is CPU-based in this MVP. Several-hour recordings can take a long time.
-- The app caches extracted MP3 and transcript JSON files under `data/`.
-- If YouTube blocks or restricts access, yt-dlp may fail. Use only videos you are authorized to access.
-- FIRST says its API data is generally available after the tournament concludes and has synced. The app uses HTTP Basic authentication.
-- FIRST requests that applications displaying FIRST API data include a link to its API information page.
+## Local data
+- `data/videos/`: downloaded video files
+- `data/frames/<video_id>/`: extracted JPEG frames
+- `data/ocr/`: OCR results in JSON and CSV
+
+These files can become large, especially the downloaded video and frame directory. Delete a video's folder under `data/` when you no longer need it.
+
+## Notes and limitations
+- Whisper/faster-whisper and PyAV are not dependencies in this video-first version.
+- Install `tesseract-ocr` with apt; the Python `pytesseract` package is only a wrapper.
+- YouTube may not offer the requested resolution as a single-file stream. yt-dlp selects the best available compatible format.
+- OCR accuracy depends on scoreboard layout, resolution, motion, contrast, and text size. Different events may need different OCR regions or preprocessing.
+- A 10-second sample interval gives roughly 15 frames during a 2:30 match, but match boundaries can fall between samples. We will refine actual start/end timestamps after validating scoreboard state/clock detection.
+- FIRST API data is generally available after an event concludes and syncs. The app uses HTTP Basic authentication and FIRST asks applications displaying API data to link to its API information page.
+- Use only videos you are authorized to access. YouTube availability and download restrictions can vary.

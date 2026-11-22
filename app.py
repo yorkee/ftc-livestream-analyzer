@@ -1,37 +1,45 @@
 import os
 import re
 import json
-import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import cv2
 import pandas as pd
 import streamlit as st
 import yt_dlp
-from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 
 from ftc_analyzer.first_api import fetch_event_schedule
-from ftc_analyzer.match_detection import detect_match_mentions, map_mentions_to_schedule
+from ftc_analyzer.video_ocr import (
+    download_video, extract_frames, run_ocr, build_observed_match_windows,
+    save_ocr_results, format_timestamp,
+)
 
 load_dotenv()
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
-AUDIO_DIR = DATA_DIR / "audio"
-TRANSCRIPT_DIR = DATA_DIR / "transcripts"
-for folder in (DATA_DIR, AUDIO_DIR, TRANSCRIPT_DIR):
+VIDEO_DIR = DATA_DIR / "videos"
+FRAME_DIR = DATA_DIR / "frames"
+OCR_DIR = DATA_DIR / "ocr"
+for folder in (DATA_DIR, VIDEO_DIR, FRAME_DIR, OCR_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="FTC Livestream Analyzer", page_icon="🤖", layout="wide")
 st.title("FTC Livestream Analyzer")
-st.caption("Local MVP · archived YouTube livestreams · audio-first match detection")
+st.caption("Local MVP · archived YouTube livestreams · video-frame scoreboard OCR")
 
 with st.sidebar:
     st.header("FIRST API credentials")
     first_username = st.text_input("FIRST API username", value=os.getenv("FIRST_API_USERNAME", ""))
     first_token = st.text_input("FIRST API authorization key", value=os.getenv("FIRST_API_TOKEN", ""), type="password")
     st.caption("Credentials are used only by this local app. Do not share your .env file.")
+    st.divider()
+    st.header("Frame sampling")
+    interval = st.select_slider("Capture one frame every", options=[5, 10, 15, 30], value=10, format_func=lambda x: f"{x} seconds")
+    max_height = st.selectbox("Maximum video resolution", [480, 720, 1080], index=1)
+    st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
 st.subheader("1. Video and event")
 youtube_url = st.text_input("Archived YouTube livestream URL", placeholder="https://www.youtube.com/watch?v=...")
@@ -40,13 +48,6 @@ season = c1.number_input("FTC season", min_value=2023, max_value=2035, value=202
 event_code = c2.text_input("FIRST event code", placeholder="e.g. MIxxxx")
 tournament = c3.selectbox("Tournament level", ["qual", "playoff"], index=0)
 
-st.subheader("2. Transcription settings")
-c4, c5, c6 = st.columns(3)
-model_name = c4.selectbox("Whisper model", ["tiny", "base", "small", "medium"], index=2,
-                          help="Start with small. Larger models are slower but may transcribe announcements more accurately.")
-compute_type = c5.selectbox("Compute type", ["int8", "float32"], index=0)
-language = c6.selectbox("Audio language", ["Auto-detect", "English"], index=0)
-st.caption("The first run downloads the selected Whisper model. Processing a multi-hour recording can take a while, especially on CPU.")
 
 def get_video_id(url: str) -> str:
     parsed = urlparse(url)
@@ -59,67 +60,41 @@ def get_video_id(url: str) -> str:
             return parsed.path.split("/")[2]
     return re.sub(r"[^A-Za-z0-9_-]", "", url)[-20:] or "video"
 
+
 def get_video_info(url: str):
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
         return ydl.extract_info(url, download=False)
 
-def extract_audio(url: str, video_id: str) -> Path:
-    output = AUDIO_DIR / f"{video_id}.%(ext)s"
-    expected = AUDIO_DIR / f"{video_id}.mp3"
-    if expected.exists() and expected.stat().st_size > 0:
-        return expected
-    opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(output),
-        "noplaylist": True,
-        "quiet": False,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "96",
-        }],
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    if not expected.exists():
-        candidates = list(AUDIO_DIR.glob(f"{video_id}.*"))
-        if not candidates:
-            raise FileNotFoundError("yt-dlp did not produce an audio file.")
-        # Convert any downloaded audio to a predictable MP3 using FFmpeg.
-        source = candidates[0]
-        subprocess.run(["ffmpeg", "-y", "-i", str(source), "-vn", "-ac", "1",
-                        "-ar", "16000", str(expected)], check=True, capture_output=True)
-    return expected
-
-def transcribe_audio(audio_path: Path, model_name: str, compute_type: str, language_choice: str):
-    model = WhisperModel(model_name, device="cpu", compute_type=compute_type)
-    kwargs = {"beam_size": 5, "vad_filter": True}
-    if language_choice == "English":
-        kwargs["language"] = "en"
-    segments, info = model.transcribe(str(audio_path), **kwargs)
-    rows = []
-    for seg in segments:
-        rows.append({
-            "start_seconds": round(float(seg.start), 2),
-            "end_seconds": round(float(seg.end), 2),
-            "text": seg.text.strip(),
-        })
-    return rows, info
 
 def yt_timestamp_url(url: str, seconds: int) -> str:
     base = url.split("&t=")[0].split("?t=")[0]
     separator = "&" if "?" in base else "?"
     return f"{base}{separator}t={max(0, int(seconds))}s"
 
+
+def schedule_team_numbers(schedule: list[dict]) -> set[int]:
+    numbers = set()
+    for match in schedule:
+        for team in match.get("teams") or []:
+            value = team.get("teamNumber", team.get("team"))
+            try:
+                if value is not None:
+                    numbers.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    return numbers
+
+
 if "video_info" not in st.session_state:
     st.session_state.video_info = None
-if "transcript_rows" not in st.session_state:
-    st.session_state.transcript_rows = None
-if "audio_path" not in st.session_state:
-    st.session_state.audio_path = None
-if "mapped_rows" not in st.session_state:
-    st.session_state.mapped_rows = None
+if "video_path" not in st.session_state:
+    st.session_state.video_path = None
+if "frame_rows" not in st.session_state:
+    st.session_state.frame_rows = None
+if "ocr_rows" not in st.session_state:
+    st.session_state.ocr_rows = None
+if "match_windows" not in st.session_state:
+    st.session_state.match_windows = None
 
 if st.button("Inspect YouTube video", type="secondary", disabled=not youtube_url):
     try:
@@ -141,71 +116,100 @@ if info:
     m3.metric("Video ID", info.get("id", "Unknown"))
 
 st.divider()
-st.subheader("3. Extract audio and transcribe")
-if st.button("Extract audio + transcribe", type="primary", disabled=not youtube_url):
+st.subheader("2. Download video and capture frames")
+st.info(f"The analyzer will sample one frame every {interval} seconds. A 2.5-minute match should therefore have about 15 sampled frames, depending on where its scoreboard appears.")
+if st.button("Download video + capture frames", type="primary", disabled=not youtube_url):
     try:
         video_id = get_video_id(youtube_url)
-        with st.spinner("Extracting audio with yt-dlp and FFmpeg. This may take several minutes..."):
-            audio_path = extract_audio(youtube_url, video_id)
-        st.session_state.audio_path = str(audio_path)
-        st.success(f"Audio ready: {audio_path.name}")
-        with st.spinner(f"Transcribing with Whisper '{model_name}'. Long recordings may take substantial time..."):
-            rows, whisper_info = transcribe_audio(audio_path, model_name, compute_type, language)
-        st.session_state.transcript_rows = rows
-        transcript_file = TRANSCRIPT_DIR / f"{video_id}.json"
-        transcript_file.write_text(json.dumps({
-            "video_url": youtube_url,
-            "video_id": video_id,
-            "language": getattr(whisper_info, "language", None),
-            "segments": rows,
-        }, indent=2), encoding="utf-8")
-        st.success(f"Transcription complete: {len(rows)} speech segments.")
+        video_progress = st.progress(0, text="Preparing video download...")
+        with st.spinner("Downloading the video stream. Multi-hour livestreams can be several gigabytes..."):
+            video_path = download_video(youtube_url, video_id, VIDEO_DIR, int(max_height))
+        st.session_state.video_path = str(video_path)
+        video_progress.progress(1.0, text=f"Video ready: {video_path.name}")
+        frame_dir = FRAME_DIR / video_id
+        with st.spinner(f"Extracting one frame every {interval} seconds with FFmpeg..."):
+            frames = extract_frames(video_path, frame_dir, int(interval))
+        st.session_state.frame_rows = frames
+        st.session_state.ocr_rows = None
+        st.session_state.match_windows = None
+        st.success(f"Captured {len(frames):,} frames. They are saved under data/frames/{video_id}/.")
     except Exception as exc:
         st.exception(exc)
 
-rows = st.session_state.transcript_rows
-if rows is not None:
-    st.subheader("Transcript preview")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=260)
-    st.download_button("Download transcript JSON",
-                       data=json.dumps(rows, indent=2),
-                       file_name="ftc_transcript.json",
-                       mime="application/json")
+frame_rows = st.session_state.frame_rows
+if frame_rows:
+    st.subheader("Captured frame preview")
+    preview_count = min(12, len(frame_rows))
+    preview_indices = sorted(set(round(i * (len(frame_rows) - 1) / max(1, preview_count - 1)) for i in range(preview_count)))
+    cols = st.columns(3)
+    for i, frame_index in enumerate(preview_indices):
+        row = frame_rows[frame_index]
+        image = cv2.imread(row["frame_path"])
+        if image is not None:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            with cols[i % 3]:
+                st.image(image, caption=f"{row['timestamp']} · frame {frame_index}", use_container_width=True)
+    st.caption("Preview is sampled across the recording. Check that the match scoreboard is visible and readable before running OCR.")
 
 st.divider()
-st.subheader("4. Detect match numbers and map teams")
-if st.button("Detect matches + fetch FIRST schedule",
-             disabled=not rows or not event_code or not first_username or not first_token):
+st.subheader("3. Read scoreboard text with OCR")
+if st.button("Run OCR on captured frames", disabled=not frame_rows):
     try:
-        with st.spinner("Fetching official FIRST hybrid schedule..."):
-            schedule = fetch_event_schedule(int(season), event_code.strip(),
-                                             tournament, first_username.strip(), first_token.strip())
-        mentions = detect_match_mentions(rows)
-        mapped = map_mentions_to_schedule(mentions, schedule, youtube_url)
-        st.session_state.mapped_rows = mapped
-        st.session_state.schedule_count = len(schedule)
-        st.session_state.mentions = mentions
-        st.success(f"Loaded {len(schedule)} schedule entries; detected {len(mentions)} possible match announcements.")
+        known_teams = None
+        schedule = None
+        if event_code and first_username and first_token:
+            with st.spinner("Loading the FIRST event schedule to validate recognized team numbers..."):
+                schedule = fetch_event_schedule(int(season), event_code.strip(), tournament,
+                                                first_username.strip(), first_token.strip())
+            known_teams = schedule_team_numbers(schedule)
+            st.session_state.schedule = schedule
+        progress = st.progress(0, text="Starting OCR...")
+        def update_progress(fraction, current, total):
+            progress.progress(fraction, text=f"Reading frame {current:,} of {total:,}...")
+        with st.spinner("Running Tesseract OCR on each captured frame..."):
+            ocr_rows = run_ocr(frame_rows, known_teams, update_progress)
+        st.session_state.ocr_rows = ocr_rows
+        st.session_state.match_windows = build_observed_match_windows(ocr_rows, int(interval))
+        video_id = get_video_id(youtube_url)
+        save_ocr_results(ocr_rows, OCR_DIR / f"{video_id}.json", OCR_DIR / f"{video_id}.csv")
+        st.success(f"OCR complete: processed {len(ocr_rows):,} frames. Results saved under data/ocr/.")
     except Exception as exc:
         st.exception(exc)
 
-mapped = st.session_state.mapped_rows
-if mapped is not None:
-    st.subheader("Team / match / video mapping")
-    st.caption("A match mention is a candidate, not proof. Review confidence and verify the timestamp against the recording.")
-    df = pd.DataFrame(mapped)
-    st.dataframe(df, use_container_width=True, height=420)
-    st.download_button("Download team-match CSV", df.to_csv(index=False),
-                       file_name="ftc_team_match_timestamps.csv", mime="text/csv")
-    st.download_button("Download mapping JSON", json.dumps(mapped, indent=2),
-                       file_name="ftc_team_match_timestamps.json", mime="application/json")
+ocr_rows = st.session_state.ocr_rows
+if ocr_rows:
+    st.subheader("OCR results")
+    ocr_df = pd.DataFrame(ocr_rows)
+    display_columns = ["timestamp", "ocr_confidence", "match_number_candidate", "team_number_candidates", "ocr_text"]
+    st.dataframe(ocr_df[display_columns], use_container_width=True, height=420)
+    st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
+                       file_name="ftc_ocr_results.csv", mime="text/csv")
+    st.download_button("Download OCR results (JSON)", json.dumps(ocr_rows, indent=2),
+                       file_name="ftc_ocr_results.json", mime="application/json")
+
+    st.subheader("Candidate match windows")
+    windows = st.session_state.match_windows or []
+    if windows:
+        window_rows = []
+        for item in windows:
+            start = int(item["first_seen_seconds"])
+            window_rows.append({
+                **item,
+                "youtube_link": yt_timestamp_url(youtube_url, start),
+            })
+        st.dataframe(pd.DataFrame(window_rows), use_container_width=True, height=320)
+        st.caption("These are scoreboard-observation windows, not verified match start/end times. The scoreboard may show an upcoming match before play begins.")
+    else:
+        st.warning("No match numbers were recognized yet. Review the OCR text and scoreboard frame previews; the overlay may need a region-specific OCR pass or tuned text patterns.")
 
 with st.expander("Troubleshooting and limitations"):
     st.markdown("""
-    - This MVP detects spoken match-number phrases in the transcript. If announcers do not say match numbers clearly, detections can be missed.
-    - FIRST's hybrid schedule provides official match/team associations, but its schedule times are **not** used as YouTube timestamps.
-    - The initial detector is audio-first. Scoreboard OCR and visual boundary verification are the next iteration.
-    - FIRST API data is generally made available after an event concludes and syncs.
+    - This version analyzes video frames, not audio. Whisper and PyAV are no longer required.
+    - Install the system OCR engine with `sudo apt install tesseract-ocr` and ensure `ffmpeg` is installed.
+    - The default is one frame every 10 seconds; 5, 15, and 30 seconds are also available.
+    - Downloading a multi-hour video can require substantial disk space and time. The selected maximum resolution limits the stream when YouTube offers a suitable format.
+    - OCR output is raw recognition. Different events use different scoreboard layouts, so text recognition and team-number parsing may need tuning for each stream.
+    - Match windows show when a scoreboard label was observed. They are not exact play boundaries until we add visual match-state/clock transition detection.
     - Use only videos you are authorized to access. YouTube availability and download restrictions can vary.
     """)
     st.markdown("FIRST API information: https://ftc-events.firstinspires.org/services/API")
