@@ -93,26 +93,32 @@ def format_timestamp(seconds: int | float) -> str:
 
 
 def _ocr_text(image_path: str) -> tuple[str, float]:
+    """Read match/event text only from the top and bottom banner search bands."""
     image = Image.open(image_path).convert("RGB")
-    # Upscale smaller frames slightly; OCR works better on small overlay text.
-    if image.width < 1000:
-        scale = 1000 / image.width
-        image = image.resize((1000, int(image.height * scale)))
-    data = pytesseract.image_to_data(image, config="--psm 11", output_type=Output.DICT)
+    width, height = image.size
+    band_height = max(1, int(height * 0.25))
+    regions = [
+        image.crop((0, 0, width, band_height)),
+        image.crop((0, height - band_height, width, height)),
+    ]
     words, confidences = [], []
-    for word, conf in zip(data.get("text", []), data.get("conf", [])):
-        word = word.strip()
-        try:
-            confidence = float(conf)
-        except (TypeError, ValueError):
-            confidence = -1
-        if word:
-            words.append(word)
-        if confidence >= 0:
-            confidences.append(confidence)
+    for crop in regions:
+        if crop.width < 1000:
+            scale = 1000 / crop.width
+            crop = crop.resize((1000, int(crop.height * scale)))
+        data = pytesseract.image_to_data(crop, config="--psm 11", output_type=Output.DICT)
+        for word, conf in zip(data.get("text", []), data.get("conf", [])):
+            word = word.strip()
+            try:
+                confidence = float(conf)
+            except (TypeError, ValueError):
+                confidence = -1
+            if word:
+                words.append(word)
+            if confidence >= 0:
+                confidences.append(confidence)
     average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
     return " ".join(words), average
-
 
 MATCH_PATTERNS = [
     re.compile(r"\b(?:qualification|qualifying|qual|q)\s*(?:match\s*)?(?:no\.?\s*)?(\d{1,3})\b", re.I),
