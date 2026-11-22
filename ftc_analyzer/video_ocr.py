@@ -143,67 +143,95 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
     return sorted(digits)
 
 
-def _ocr_team_panel(image_path: str, alliance: str) -> tuple[list[int], str, float]:
-    """Read the two team-number cards from one alliance's scoreboard panel.
+def _ocr_team_numbers_by_side(image_path: str,
+                              known_team_numbers: Iterable[int] | None = None
+                              ) -> tuple[list[int], list[int], str, float]:
+    """Find team-number OCR tokens anywhere in the frame and assign by x position.
 
-    The current template targets the FTC Canopy-style 16:9 overlay shown in the
-    Saline Preview sample. Coordinates are proportional, so 720p and 1080p
-    frames use the same crop. Other overlay layouts will need another template.
+    This intentionally does not assume a fixed scoreboard location or vertical
+    orientation. FTC overlays vary, but the red alliance is on the left and
+    blue alliance is on the right. When a FIRST event roster is supplied, exact
+    roster matches are used to reject scores, timers, and unrelated numbers.
     """
-    image = Image.open(image_path).convert("RGB")
-    width, height = image.size
-    # Team-number cards sit in the lower scoreboard strip, left of each
-    # alliance's score. Keep each alliance isolated to avoid cross-reading.
-    regions = {
-        "red": (0.235, 0.845, 0.333, 1.0),
-        "blue": (0.667, 0.845, 0.765, 1.0),
-    }
-    if alliance not in regions:
-        raise ValueError("alliance must be 'red' or 'blue'")
-    left, top, right, bottom = regions[alliance]
-    crop = image.crop((int(left * width), int(top * height),
-                       int(right * width), int(bottom * height)))
-    # Enlarge the relatively small cards, then use a high-contrast grayscale
-    # image. Tesseract is constrained to digits to reduce icon/score noise.
-    crop = crop.resize((crop.width * 4, crop.height * 4))
     import numpy as np
-    gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
-    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
-    config = "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789"
+
+    image = Image.open(image_path).convert("RGB")
+    original_width = image.width
+    # Upscale to help read small broadcast overlays while preserving coordinates.
+    if image.width < 1600:
+        scale = 1600 / image.width
+        image = image.resize((1600, int(image.height * scale)))
+    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    config = "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
     data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
-    words, confidences = [], []
-    for word, conf in zip(data.get("text", []), data.get("conf", [])):
-        word = word.strip()
+
+    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
+    candidates = []
+    raw_words = []
+    confidences = []
+    scale_x = image.width / original_width
+    for i, token in enumerate(data.get("text", [])):
+        token = token.strip()
         try:
-            score = float(conf)
-        except (TypeError, ValueError):
-            score = -1
-        if word:
-            words.append(word)
-        if score >= 0:
-            confidences.append(score)
-    raw = " ".join(words)
-    numbers = []
-    for value in re.findall(r"(?<!\\d)(\\d{3,6})(?!\\d)", raw):
-        number = int(value)
-        if number not in numbers:
-            numbers.append(number)
+            confidence = float(data["conf"][i])
+            left = float(data["left"][i])
+            top = float(data["top"][i])
+            width = float(data["width"][i])
+            height = float(data["height"][i])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not token:
+            continue
+        raw_words.append(token)
+        if confidence >= 0:
+            confidences.append(confidence)
+
+        # OCR sometimes inserts punctuation or spaces into a team number.
+        digit_runs = re.findall(r"(?<!\\d)(\\d{3,6})(?!\\d)", token)
+        for digits in digit_runs:
+            number = int(digits)
+            if roster is not None and number not in roster:
+                continue
+            if confidence < 25:
+                continue
+            center_x = (left + width / 2) / scale_x
+            center_y = (top + height / 2) / scale_x
+            candidates.append({
+                "number": number,
+                "x": center_x,
+                "y": center_y,
+                "confidence": confidence,
+            })
+
+    # Prefer high-confidence detections and avoid duplicate readings of a card.
+    # Two unique team numbers per side are expected in a standard FTC match.
+    def select_side(side: str) -> list[int]:
+        midpoint = original_width / 2
+        side_items = [c for c in candidates
+                      if (c["x"] < midpoint if side == "red" else c["x"] >= midpoint)]
+        side_items.sort(key=lambda c: c["confidence"], reverse=True)
+        selected = []
+        for item in side_items:
+            if item["number"] not in selected:
+                selected.append(item["number"])
+            if len(selected) == 2:
+                break
+        return selected
+
     average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
-    return numbers[:2], raw, average
+    return select_side("red"), select_side("blue"), " ".join(raw_words), average
 
 
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
     results = []
     total = len(frame_rows)
-    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
     for index, frame in enumerate(frame_rows, start=1):
         text, confidence = _ocr_text(frame["frame_path"])
-        red_teams, red_raw, red_conf = _ocr_team_panel(frame["frame_path"], "red")
-        blue_teams, blue_raw, blue_conf = _ocr_team_panel(frame["frame_path"], "blue")
-        if roster is not None:
-            red_teams = [n for n in red_teams if n in roster]
-            blue_teams = [n for n in blue_teams if n in roster]
+        red_teams, blue_teams, team_raw, team_conf = _ocr_team_numbers_by_side(
+            frame["frame_path"], known_team_numbers
+        )
         alliance_teams = sorted(set(red_teams + blue_teams))
         results.append({
             **frame,
@@ -212,16 +240,13 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             "match_number_candidate": detect_match_number(text),
             "red_team_numbers": red_teams,
             "blue_team_numbers": blue_teams,
-            "red_panel_ocr": red_raw,
-            "blue_panel_ocr": blue_raw,
-            "red_panel_confidence": red_conf,
-            "blue_panel_confidence": blue_conf,
+            "team_number_ocr": team_raw,
+            "team_number_ocr_confidence": team_conf,
             "team_number_candidates": alliance_teams,
         })
         if progress_callback:
             progress_callback(index / total, index, total)
     return results
-
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
     """Group consecutive frames with the same detected match number.
