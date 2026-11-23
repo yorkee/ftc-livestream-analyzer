@@ -152,88 +152,122 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
 def _ocr_team_numbers_by_side(image_path: str,
                               known_team_numbers: Iterable[int] | None = None
                               ) -> tuple[list[int], list[int], str, float]:
-    """OCR only the top and bottom banner zones, then split by left/right.
+    """Read team IDs from the four fixed alliance cells in the FTC banner.
 
-    FTC broadcast scoreboards may be at the top or bottom, but the central
-    portion of the frame is normally gameplay. Scanning only these edge bands
-    reduces OCR noise from robots, field labels, jerseys, and audience signs.
+    The banner can be at the top or bottom of the frame. Its grid layout is
+    stable: two red team cells on the left and two blue team cells on the
+    right. Cropping each number independently avoids combining unrelated
+    scoreboard digits and reduces interference from the alliance icons.
     """
     import numpy as np
 
     image = Image.open(image_path).convert("RGB")
     frame_width, frame_height = image.size
     band_height = max(1, int(frame_height * 0.25))
-    # The banner is typically about 20% of the frame. A 25% search band gives
-    # some tolerance for different overlay heights and vertical placement.
     regions = [
         ("top", image.crop((0, 0, frame_width, band_height))),
         ("bottom", image.crop((0, frame_height - band_height, frame_width, frame_height))),
     ]
+
+    # Normalized coordinates measured from representative top- and bottom-
+    # banner frames. The tighter horizontal crops exclude the team/logo icons.
+    x_cells = {
+        "red": (0.268, 0.332),
+        "blue": (0.674, 0.738),
+    }
+    y_cells = [
+        (0.37, 0.68),  # upper team-number cell
+        (0.68, 1.00),  # lower team-number cell
+    ]
     roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
-    candidates = []
+    region_results = []
     raw_words = []
-    confidences = []
+    all_confidences = []
 
-    for region_name, crop in regions:
-        scale = max(1.0, 1600 / crop.width)
-        if scale > 1:
-            crop = crop.resize((1600, int(crop.height * scale)))
-        gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
-        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-        config = "--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789"
-        data = pytesseract.image_to_data(gray, config=config, output_type=Output.DICT)
-        scale_x = crop.width / frame_width
+    for region_name, band in regions:
+        candidates = {"red": [], "blue": []}
+        region_raw = []
+        region_confidences = []
+        for side, (x0, x1) in x_cells.items():
+            for row_index, (y0, y1) in enumerate(y_cells):
+                left = max(0, int(frame_width * x0))
+                right = min(frame_width, int(frame_width * x1))
+                top = max(0, int(band_height * y0))
+                bottom = min(band_height, int(band_height * y1))
+                cell = band.crop((left, top, right, bottom))
+                if cell.width == 0 or cell.height == 0:
+                    continue
 
-        for i, token in enumerate(data.get("text", [])):
-            token = token.strip()
-            try:
-                confidence = float(data["conf"][i])
-                left = float(data["left"][i])
-                width = float(data["width"][i])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if not token:
-                continue
-            raw_words.append(token)
-            if confidence >= 0:
-                confidences.append(confidence)
-            if confidence < 25:
-                continue
+                # Enlarge each cell before OCR. Keep both grayscale and Otsu
+                # variants available because broadcast compression varies.
+                scale = max(4, int(900 / max(1, cell.width)))
+                cell = cell.resize((cell.width * scale, cell.height * scale))
+                gray = cv2.cvtColor(np.array(cell), cv2.COLOR_RGB2GRAY)
+                gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+                variants = [
+                    ("gray", gray),
+                    ("otsu", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                ]
 
-            # A team ID is usually one OCR token; roster validation handles
-            # occasional OCR confusion without admitting scores/timers.
-            digits = re.sub(r"[^0-9]", "", token)
-            if not re.fullmatch(r"\d{3,6}", digits):
-                continue
-            number = int(digits)
-            if roster is not None and number not in roster:
-                continue
+                attempts = []
+                for variant_name, processed in variants:
+                    data = pytesseract.image_to_data(
+                        processed,
+                        config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
+                        output_type=Output.DICT,
+                    )
+                    tokens = []
+                    for token, conf in zip(data.get("text", []), data.get("conf", [])):
+                        token = token.strip()
+                        try:
+                            confidence = float(conf)
+                        except (TypeError, ValueError):
+                            confidence = -1.0
+                        if token:
+                            region_raw.append(token)
+                            raw_words.append(f"{region_name}:{side}{row_index + 1}:{token}")
+                        if confidence >= 0:
+                            region_confidences.append(confidence)
+                            all_confidences.append(confidence)
+                        digits = re.sub(r"[^0-9]", "", token)
+                        if confidence >= 20 and re.fullmatch(r"\d{3,5}", digits):
+                            number = int(digits)
+                            if roster is None or number in roster:
+                                tokens.append((number, confidence, variant_name))
+                    attempts.extend(tokens)
 
-            center_x = (left + width / 2) / scale_x
-            side = "red" if center_x < frame_width / 2 else "blue"
-            candidates.append({
-                "number": number,
-                "side": side,
-                "confidence": confidence,
-                "region": region_name,
-            })
+                if attempts:
+                    # Prefer the strongest OCR confidence for this cell.
+                    best = max(attempts, key=lambda item: item[1])
+                    candidates[side].append({
+                        "number": best[0],
+                        "confidence": best[1],
+                        "row": row_index,
+                    })
 
-    def select_side(side: str) -> list[int]:
-        side_items = sorted(
-            (c for c in candidates if c["side"] == side),
-            key=lambda c: c["confidence"],
-            reverse=True,
-        )
-        selected = []
-        for item in side_items:
-            if item["number"] not in selected:
-                selected.append(item["number"])
-            if len(selected) == 2:
-                break
-        return selected
+        # Score each placement by how many distinct alliance IDs it produced,
+        # then by confidence. This chooses the actual banner when the opposite
+        # edge contains ordinary field imagery.
+        selected = {}
+        for side in ("red", "blue"):
+            side_items = sorted(candidates[side], key=lambda item: item["confidence"], reverse=True)
+            values = []
+            for item in side_items:
+                if item["number"] not in values:
+                    values.append(item["number"])
+            selected[side] = values[:2]
+        count = len(set(selected["red"])) + len(set(selected["blue"]))
+        confidence = sum(item["confidence"] for side in candidates.values() for item in side)
+        region_results.append((count, confidence, selected))
 
-    average = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
-    return select_side("red"), select_side("blue"), " ".join(raw_words), average
+    _, _, best_result = max(region_results, key=lambda result: (result[0], result[1]))
+    average = round(sum(all_confidences) / len(all_confidences), 1) if all_confidences else 0.0
+    return (
+        best_result["red"],
+        best_result["blue"],
+        " ".join(raw_words),
+        average,
+    )
 
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
