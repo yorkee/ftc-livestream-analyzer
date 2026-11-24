@@ -192,7 +192,7 @@ if ocr_rows:
     if windows:
         window_rows = []
         for item in windows:
-            start = item.get("estimated_start_seconds")
+            start = item.get("start_offset_seconds")
             if start is None:
                 start = int(item["first_seen_seconds"])
             window_rows.append({
