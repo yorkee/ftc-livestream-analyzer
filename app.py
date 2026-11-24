@@ -180,7 +180,7 @@ ocr_rows = st.session_state.ocr_rows
 if ocr_rows:
     st.subheader("OCR results")
     ocr_df = pd.DataFrame(ocr_rows)
-    display_columns = ["timestamp", "match_number_candidate", "red_team_numbers", "blue_team_numbers", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
+    display_columns = ["timestamp", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
     st.dataframe(ocr_df[display_columns], use_container_width=True, height=420)
     st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
                        file_name="ftc_ocr_results.csv", mime="text/csv")
@@ -192,10 +192,12 @@ if ocr_rows:
     if windows:
         window_rows = []
         for item in windows:
-            start = int(item["first_seen_seconds"])
+            start = item.get("estimated_start_seconds")
+            if start is None:
+                start = int(item["first_seen_seconds"])
             window_rows.append({
                 **item,
-                "youtube_link": yt_timestamp_url(youtube_url, start),
+                "youtube_link": yt_timestamp_url(youtube_url, int(start)),
             })
         st.dataframe(pd.DataFrame(window_rows), use_container_width=True, height=320)
         st.caption("These are scoreboard-observation windows, not verified match start/end times. The scoreboard may show an upcoming match before play begins.")
