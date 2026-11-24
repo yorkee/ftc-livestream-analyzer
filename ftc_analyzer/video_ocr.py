@@ -277,12 +277,73 @@ def _ocr_team_numbers_by_side(image_path: str,
         " ".join(raw_words),
         average,
     )
+def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
+    """Read the large mm:ss countdown in the center of the scoreboard banner."""
+    import numpy as np
+
+    image = Image.open(image_path).convert("RGB")
+    width, height = image.size
+    band_height = max(1, int(height * 0.25))
+    regions = [
+        image.crop((0, 0, width, band_height)),
+        image.crop((0, height - band_height, width, height)),
+    ]
+    readings = []
+    for band in regions:
+        # The large countdown sits between the red and blue alliance panels.
+        cell = band.crop((
+            int(width * 0.445),
+            int(band_height * 0.30),
+            int(width * 0.555),
+            band_height,
+        ))
+        if cell.width == 0 or cell.height == 0:
+            continue
+        cell = cell.resize((cell.width * 5, cell.height * 5))
+        gray = cv2.cvtColor(np.array(cell), cv2.COLOR_RGB2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+        variants = [
+            gray,
+            cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        ]
+        for processed in variants:
+            for psm in (7, 8):
+                text = pytesseract.image_to_string(
+                    processed,
+                    config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789:",
+                ).strip()
+                match = re.search(r"(?<!\d)(\d{1,2})\s*[:;.,]?\s*(\d{2})(?!\d)", text)
+                if not match:
+                    continue
+                minutes, seconds = int(match.group(1)), int(match.group(2))
+                if seconds >= 60:
+                    continue
+                total_seconds = minutes * 60 + seconds
+                if 0 <= total_seconds <= 150:
+                    readings.append((total_seconds, text))
+    if not readings:
+        return None, None, 0.0
+    # The center countdown has only one plausible value in the valid range;
+    # choose the most frequently recognized value across preprocessing modes.
+    counts = {}
+    for value, raw in readings:
+        counts.setdefault(value, []).append(raw)
+    best_value = max(counts, key=lambda value: (len(counts[value]), value))
+    raw_text = counts[best_value][0]
+    return f"{best_value // 60}:{best_value % 60:02d}", best_value, round(
+        len(counts[best_value]) / len(readings) * 100, 1
+    )
+
+
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
             progress_callback=None) -> list[dict]:
     results = []
     total = len(frame_rows)
     for index, frame in enumerate(frame_rows, start=1):
         text, confidence = _ocr_text(frame["frame_path"])
+        match_clock, match_clock_seconds, match_clock_confidence = _ocr_match_clock(
+            frame["frame_path"]
+        )
         red_teams, blue_teams, team_raw, team_conf = _ocr_team_numbers_by_side(
             frame["frame_path"], known_team_numbers
         )
@@ -292,6 +353,9 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             "ocr_text": text,
             "ocr_confidence": confidence,
             "match_number_candidate": detect_match_number(text),
+            "match_clock": match_clock,
+            "match_clock_seconds": match_clock_seconds,
+            "match_clock_confidence": match_clock_confidence,
             "red_team_numbers": red_teams,
             "blue_team_numbers": blue_teams,
             "team_number_ocr": team_raw,
@@ -303,28 +367,58 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
     return results
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
-    """Group consecutive frames with the same detected match number.
+    """Group match observations and estimate the actual start from the 2:30 clock.
 
-    Boundaries are observed windows, not exact match start/end times. A scoreboard
-    can show a match before play starts or after play ends.
+    For every in-progress clock reading, estimated start = video timestamp -
+    (150 seconds - displayed clock). The median estimate reduces OCR jitter.
     """
     windows = []
     current = None
+
+    def finish(item):
+        if not item:
+            return
+        item["observed_until_seconds"] = item["last_seen_seconds"] + interval_seconds
+        item["first_seen"] = format_timestamp(item["first_seen_seconds"])
+        item["observed_until"] = format_timestamp(item["observed_until_seconds"])
+        estimates = item.pop("start_estimates", [])[:5]
+        if estimates:
+            estimates.sort()
+            middle = len(estimates) // 2
+            if len(estimates) % 2:
+                estimate = estimates[middle]
+            else:
+                estimate = (estimates[middle - 1] + estimates[middle]) / 2
+            item["estimated_start_seconds"] = max(0, round(estimate))
+            item["estimated_start"] = format_timestamp(item["estimated_start_seconds"])
+            item["start_estimate_samples"] = len(estimates)
+            item["boundary_note"] = (
+                "Estimated from the 2:30 countdown across in-progress frames; "
+                "verify around this timestamp for the exact first motion/clock transition."
+            )
+        else:
+            item["estimated_start_seconds"] = None
+            item["estimated_start"] = None
+            item["start_estimate_samples"] = 0
+            item["boundary_note"] = (
+                "No reliable in-progress countdown readings; only the observed scoreboard window is available."
+            )
+        windows.append(item)
+
     for row in ocr_rows:
         number = row.get("match_number_candidate")
         if number is None:
-            if current:
-                windows.append(current)
-                current = None
+            finish(current)
+            current = None
             continue
+
         teams = row.get("team_number_candidates") or []
         if current and current["match_number"] == number:
             current["last_seen_seconds"] = row["timestamp_seconds"]
             current["frames_seen"] += 1
             current["team_numbers_seen"] = sorted(set(current["team_numbers_seen"]) | set(teams))
         else:
-            if current:
-                windows.append(current)
+            finish(current)
             current = {
                 "match_number": number,
                 "first_seen_seconds": row["timestamp_seconds"],
@@ -332,16 +426,18 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
                 "observed_until_seconds": row["timestamp_seconds"] + interval_seconds,
                 "frames_seen": 1,
                 "team_numbers_seen": teams,
-                "boundary_note": "Observed scoreboard window; not an exact play start/end.",
+                "start_estimates": [],
             }
-    if current:
-        windows.append(current)
-    for item in windows:
-        item["observed_until_seconds"] = item["last_seen_seconds"] + interval_seconds
-        item["first_seen"] = format_timestamp(item["first_seen_seconds"])
-        item["observed_until"] = format_timestamp(item["observed_until_seconds"])
-    return windows
 
+        clock_seconds = row.get("match_clock_seconds")
+        if clock_seconds is not None and 0 < int(clock_seconds) < 150:
+            elapsed = 150 - int(clock_seconds)
+            current["start_estimates"].append(
+                float(row["timestamp_seconds"]) - elapsed
+            )
+
+    finish(current)
+    return windows
 
 def save_ocr_results(rows: list[dict], json_path: Path, csv_path: Path) -> None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
