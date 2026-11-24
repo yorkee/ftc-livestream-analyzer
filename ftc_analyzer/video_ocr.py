@@ -85,6 +85,51 @@ def extract_frames(video_path: Path, frame_dir: Path, interval_seconds: int = 10
     return rows
 
 
+
+def iter_stream_frames(media_url: str, frame_dir: Path, interval_seconds: int = 10, max_width: int = 1280):
+    """Yield JPEG frames directly from an FFmpeg media stream."""
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", media_url,
+               "-vf", f"fps=1/{interval_seconds},scale='min({max_width},iw)':-2",
+               "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    buffer = bytearray()
+    index = 0
+    try:
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while True:
+                start = buffer.find(bytes([255, 216]))
+                if start < 0:
+                    if len(buffer) > 2: del buffer[:-2]
+                    break
+                end = buffer.find(bytes([255, 217]), start + 2)
+                if end < 0:
+                    if start: del buffer[:start]
+                    break
+                jpeg = bytes(buffer[start:end + 2])
+                del buffer[:end + 2]
+                path = frame_dir / f"live_frame_{index:08d}.jpg"
+                path.write_bytes(jpeg)
+                image = cv2.imread(str(path))
+                if image is None: continue
+                height, width = image.shape[:2]
+                yield {"frame_index": index, "timestamp_seconds": index * interval_seconds,
+                       "timestamp": format_timestamp(index * interval_seconds),
+                       "frame_path": str(path), "width": width, "height": height}
+                index += 1
+        code = process.wait()
+        if code:
+            error = process.stderr.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"FFmpeg stream reader failed: {error[-2000:]}")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+
 def format_timestamp(seconds: int | float) -> str:
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
