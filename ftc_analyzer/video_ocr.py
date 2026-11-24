@@ -367,10 +367,16 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
     return results
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
-    """Group match observations and estimate the actual start from the 2:30 clock.
+    """Group scoreboard observations and backtrack from the stable teleop clock.
 
-    For every in-progress clock reading, estimated start = video timestamp -
-    (150 seconds - displayed clock). The median estimate reduces OCR jitter.
+    FTC match sequence used here:
+      * Autonomous: 2:30 down to 2:00 (30 seconds)
+      * Transition: 0:08 down to 0:00 (8 seconds)
+      * Teleop: 2:00 down to 0:00 (120 seconds)
+
+    The most reliable anchor is a frame around the 1:00 teleop mark where all
+    four team IDs are still visible. At that point elapsed match time is
+    30 + 8 + (120 - clock) = 158 - clock seconds.
     """
     windows = []
     current = None
@@ -381,7 +387,7 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
         item["observed_until_seconds"] = item["last_seen_seconds"] + interval_seconds
         item["first_seen"] = format_timestamp(item["first_seen_seconds"])
         item["observed_until"] = format_timestamp(item["observed_until_seconds"])
-        estimates = item.pop("start_estimates", [])[:5]
+        estimates = item.pop("start_estimates", [])
         if estimates:
             estimates.sort()
             middle = len(estimates) // 2
@@ -391,17 +397,23 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
                 estimate = (estimates[middle - 1] + estimates[middle]) / 2
             item["estimated_start_seconds"] = max(0, round(estimate))
             item["estimated_start"] = format_timestamp(item["estimated_start_seconds"])
+            item["start_offset_seconds"] = item["estimated_start_seconds"]
+            item["start_offset"] = format_timestamp(item["start_offset_seconds"])
             item["start_estimate_samples"] = len(estimates)
             item["boundary_note"] = (
-                "Estimated from the 2:30 countdown across in-progress frames; "
-                "verify around this timestamp for the exact first motion/clock transition."
+                "Backtracked from frames near the 1:00 teleop mark with all four "
+                "team IDs detected. Estimated offset = video timestamp - (158 - "
+                "displayed clock seconds)."
             )
         else:
             item["estimated_start_seconds"] = None
             item["estimated_start"] = None
+            item["start_offset_seconds"] = None
+            item["start_offset"] = None
             item["start_estimate_samples"] = 0
             item["boundary_note"] = (
-                "No reliable in-progress countdown readings; only the observed scoreboard window is available."
+                "No qualifying frame near the 1:00 teleop mark with all four team "
+                "IDs detected; only the observed scoreboard window is available."
             )
         windows.append(item)
 
@@ -412,7 +424,9 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
             current = None
             continue
 
-        teams = row.get("team_number_candidates") or []
+        red = row.get("red_team_numbers") or []
+        blue = row.get("blue_team_numbers") or []
+        teams = row.get("team_number_candidates") or sorted(set(red + blue))
         if current and current["match_number"] == number:
             current["last_seen_seconds"] = row["timestamp_seconds"]
             current["frames_seen"] += 1
@@ -429,9 +443,12 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
                 "start_estimates": [],
             }
 
-        clock_seconds = row.get("match_clock_seconds")
-        if clock_seconds is not None and 0 < int(clock_seconds) < 150:
-            elapsed = 150 - int(clock_seconds)
+        clock = row.get("match_clock_seconds")
+        # Only use the stable teleop section around one minute remaining.
+        # This avoids the ambiguous 2:00 reading at the auto/transition boundary.
+        all_four = len(red) == 2 and len(blue) == 2 and len(set(red + blue)) == 4
+        if clock is not None and 45 <= int(clock) <= 75 and all_four:
+            elapsed = 158 - int(clock)
             current["start_estimates"].append(
                 float(row["timestamp_seconds"]) - elapsed
             )
