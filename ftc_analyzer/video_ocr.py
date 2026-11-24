@@ -312,7 +312,7 @@ def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
                     processed,
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789:",
                 ).strip()
-                match = re.search(r"(?<!\\d)(\\d{1,2})\\s*[:;.,]?\\s*(\\d{2})(?!\\d)", text)
+                match = re.search(r"(?<!\d)(\d{1,2})\s*[:;.,]?\s*(\d{2})(?!\d)", text)
                 if not match:
                     continue
                 minutes, seconds = int(match.group(1)), int(match.group(2))
@@ -381,7 +381,7 @@ def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) ->
         item["observed_until_seconds"] = item["last_seen_seconds"] + interval_seconds
         item["first_seen"] = format_timestamp(item["first_seen_seconds"])
         item["observed_until"] = format_timestamp(item["observed_until_seconds"])
-        estimates = item.pop("start_estimates", [])
+        estimates = item.pop("start_estimates", [])[:5]
         if estimates:
             estimates.sort()
             middle = len(estimates) // 2
