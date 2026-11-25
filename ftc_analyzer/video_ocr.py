@@ -246,7 +246,8 @@ def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
 
 
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
-            progress_callback=None, schedule: list[dict] | None = None) -> list[dict]:
+            progress_callback=None, schedule: list[dict] | None = None, *, enable_voting=True, enable_schedule=True) -> list[dict]:
+    roster = set(map(int, known_team_numbers)) if known_team_numbers is not None else None
     results = []
     total = len(frame_rows)
     for index, frame in enumerate(frame_rows, start=1):
@@ -267,8 +268,13 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             frame["frame_path"]
         )
         red_teams, blue_teams, team_raw, team_conf, team_slots = _ocr_team_numbers_by_side(
-            frame["frame_path"], known_team_numbers
+            frame["frame_path"], None
         )
+        raw_slots = team_slots.copy()
+        if roster is not None:
+            team_slots = {k: v if v in roster else None for k, v in team_slots.items()}
+        red_teams = [team_slots[k] for k in ('red1', 'red2') if team_slots.get(k) is not None]
+        blue_teams = [team_slots[k] for k in ('blue1', 'blue2') if team_slots.get(k) is not None]
         alliance_teams = sorted(set(red_teams + blue_teams))
         results.append({
             **frame,
@@ -284,14 +290,17 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             "team_number_ocr": team_raw,
             "team_number_ocr_confidence": team_conf,
             "team_number_candidates": alliance_teams,
-            "team_slots_raw": team_slots,
+            "team_slots_raw": raw_slots,
+            "team_slots_filtered": team_slots.copy(),
             "team_slots": team_slots.copy(),
             "team_number_source": "single_frame_ocr",
             "teams_complete": len(alliance_teams) == 4 and len(red_teams) == 2 and len(blue_teams) == 2,
         })
         if progress_callback:
             progress_callback(index / total, index, total)
-    return stabilize_team_numbers(results, schedule)
+    if enable_voting or (enable_schedule and schedule):
+        return stabilize_team_numbers(results, schedule if enable_schedule else None, enable_voting=enable_voting)
+    return results
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
     """Group scoreboard observations and backtrack from the stable teleop clock.

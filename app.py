@@ -12,6 +12,7 @@ import yt_dlp
 from dotenv import load_dotenv
 
 from ftc_analyzer.first_api import fetch_event_schedule
+from ftc_analyzer.scoreboard import live_boxes, digit_crop, read_team_slots, SLOTS
 from ftc_analyzer.frame_import import import_frame_folder
 from ftc_analyzer.video_ocr import (
     download_video, extract_frames, run_ocr, build_observed_match_windows,
@@ -255,7 +256,15 @@ if frame_rows:
 
 st.divider()
 st.subheader("3. Read scoreboard text with OCR")
-if frame_rows:
+filter_roster = st.checkbox("Enable FIRST roster filtering", value=False)
+vote_frames = st.checkbox("Enable multi-frame voting", value=False)
+correct_schedule = st.checkbox("Enable FIRST schedule correction", value=False)
+show_raw = st.checkbox("Show raw OCR results", value=True)
+show_crops = st.checkbox("Show detected crop regions", value=True)
+if (filter_roster or correct_schedule) and not (event_code and first_username and first_token):
+    st.warning("FIRST validation requires an event code and API credentials.")
+
+if frame_rows and show_crops:
     with st.expander("Inspect a single frame / OCR crops"):
         idx = st.selectbox("Frame", range(len(frame_rows)), format_func=lambda i: f"{frame_rows[i]['frame_index']} · {frame_rows[i]['timestamp']}")
         if st.button("Inspect selected frame"):
@@ -279,17 +288,19 @@ if st.button("Run OCR on captured frames", disabled=not frame_rows):
     try:
         known_teams = None
         schedule = None
-        if event_code and first_username and first_token:
+        if (filter_roster or correct_schedule) and event_code and first_username and first_token:
             with st.spinner("Loading the FIRST event schedule to validate recognized team numbers..."):
                 schedule = fetch_event_schedule(int(season), event_code.strip(), tournament,
                                                 first_username.strip(), first_token.strip())
-            known_teams = schedule_team_numbers(schedule)
+            known_teams = (schedule_team_numbers(schedule) or None) if filter_roster else None
+            if filter_roster and known_teams is None:
+                st.warning('Empty FIRST roster; filtering disabled.')
             st.session_state.schedule = schedule
         progress = st.progress(0, text="Starting OCR...")
         def update_progress(fraction, current, total):
             progress.progress(fraction, text=f"Reading frame {current:,} of {total:,}...")
         with st.spinner("Running Tesseract OCR on each captured frame..."):
-            ocr_rows = run_ocr(frame_rows, known_teams, update_progress, schedule=schedule)
+            ocr_rows = run_ocr(frame_rows, known_teams, update_progress, schedule=schedule, enable_voting=vote_frames, enable_schedule=correct_schedule)
         st.session_state.ocr_rows = ocr_rows
         st.session_state.match_windows = build_observed_match_windows(ocr_rows, int(interval))
         export_key = f"{key}_{interval}s"
@@ -303,6 +314,8 @@ if ocr_rows:
     st.subheader("OCR results")
     ocr_df = pd.DataFrame(ocr_rows)
     display_columns = ["timestamp", "scoreboard_format", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
+    if show_raw:
+        display_columns = ["frame_index", "team_slots_raw", "team_slots_filtered", "team_slots_voted"] + display_columns
     st.dataframe(ocr_df.reindex(columns=display_columns), use_container_width=True, height=420)
     st.caption("Team numbers are read from dynamically detected red/blue overlay panels at the top or bottom of a frame. Temporal voting and optional FIRST match-schedule verification are reflected in team_number_source; team_slots_raw retains uncorrected reads in exports.")
     st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
