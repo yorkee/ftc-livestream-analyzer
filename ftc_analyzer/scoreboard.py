@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from itertools import combinations
 import re
 from typing import Iterable
 
@@ -105,33 +106,72 @@ def _read_digits(crop: np.ndarray, roster: set[int] | None) -> tuple[int | None,
     return best, round(conf, 1), " ".join(debug)
 
 
-def read_team_slots(frame: np.ndarray, known_team_numbers: Iterable[int] | None = None
-                    ) -> tuple[dict[str, int | None], str, float]:
-    """Read exactly four slots, preserving red/blue and first/second position."""
-    slots: dict[str, int | None] = {key: None for key in SLOTS}
-    panels = detect_alliance_panels(frame)
-    if not panels:
-        return slots, "no aligned red/blue scoreboard panels", 0.
-    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
-    observations = []
-    confidences = []
-    frame_height, frame_width = frame.shape[:2]
-    for side in ("red", "blue"):
-        x, y, w, h = panels[side]
-        # Column positions follow alliance icons, relative to the detected panel.
-        left = max(0, round(x + w * .07))
-        right = min(frame_width, round(x + w * .205))
-        for row, (top_ratio, bottom_ratio) in enumerate(((.045, .49), (.49, .99)), 1):
-            top = max(0, round(y + h * top_ratio))
-            bottom = min(frame_height, round(y + h * bottom_ratio))
-            value, confidence, raw = _read_digits(frame[top:bottom, left:right], roster)
-            slot = f"{side}{row}"
-            slots[slot] = value
-            observations.append(f"{slot}={value or '?'} ({raw})")
-            if value is not None:
-                confidences.append(confidence)
-    mean_conf = round(sum(confidences) / len(confidences), 1) if confidences else 0.
-    return slots, " | ".join(observations), mean_conf
+def live_boxes(frame):
+    """Discover white clock and paired team cells in the live scoreboard."""
+    if frame is None:
+        return {}
+    h, w = frame.shape[:2]
+    mask = cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), (0, 0, 180), (179, 65, 255))
+    mask[int(h*.36):int(h*.64)] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(2, round(w*.006)), max(2, round(h*.015)))))
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > w*h*.001]
+    clocks = [(x,y,a,b) for x,y,a,b in boxes if abs(x+a/2-w/2)<w*.045
+              and .07*w<a<.16*w and .10*h<b<.23*h and (y+b<h*.36 or y>h*.64)]
+    for x,y,a,b in clocks:
+        out = {"clock": (x,y,a,b)}
+        for side in ("red", "blue"):
+            candidates = [(u,v,p,q) for u,v,p,q in boxes if .065*w<p<.19*w
+                          and .045*h<q<.14*h and y-.02*h<v<y+b
+                          and v+q<y+b+.06*h and (u+p<x if side=="red" else u>x+a)]
+            pairs = []
+            for first, second in combinations(sorted(candidates,key=lambda z:z[1]),2):
+                u,v,p,q = first
+                U,V,P,Q = second
+                if (abs(u-U)<.025*w and abs(p-P)<.04*w and abs(q-Q)<.045*h
+                    and -.008*h<V-v-q<.025*h and abs(V+q-y-b)<.035*h):
+                    pairs.append((abs(v-y)+abs(V+Q-y-b),first,second))
+            if not pairs:
+                break
+            _, first, second = min(pairs)
+            out[side+"1"] = first
+            out[side+"2"] = (second[0],second[1],second[2],min(first[3],second[3]))
+        if len(out)==5:
+            return out
+    return {}
+
+
+def digit_crop(frame, slot, box):
+    x,y,w,h = box
+    # Red logo is on the left; blue logo is on the right.
+    left, right = (.28,.97) if slot.startswith("red") else (.03,.72)
+    pad = max(1, round(h*.06))
+    return frame[y+pad:y+h-pad,x+int(w*left):x+int(w*right)]
+
+
+def read_team_slots(frame, known_team_numbers=None):
+    slots = dict.fromkeys(SLOTS)
+    boxes = live_boxes(frame)
+    if not boxes:
+        return slots, "skipped: non-live scoreboard", 0.
+    roster = set(known_team_numbers) if known_team_numbers is not None else None
+    raw, confidences = [], []
+    for slot in SLOTS:
+        crop = digit_crop(frame, slot, boxes[slot])
+        enlarged = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        data = pytesseract.image_to_data(enlarged, config="--psm 7 -c tessedit_char_whitelist=0123456789", output_type=Output.DICT)
+        token = "".join(t.strip() for t in data["text"] if t.strip())
+        confidence = max((float(c) for c in data["conf"] if float(c)>=0), default=0.)
+        value = int(token) if re.fullmatch(r"[1-9][0-9]{2,4}", token) else None
+        if value is None or (roster is not None and value not in roster):
+            value, confidence, extra = _read_digits(crop, roster)
+            token += " " + extra
+        slots[slot] = value
+        raw.append(f"{slot}: {token}")
+        if value is not None:
+            confidences.append(confidence)
+    return slots, " | ".join(raw), round(sum(confidences)/len(confidences),1) if confidences else 0.
 
 
 def _schedule_slots(schedule: list[dict] | None) -> dict[int, dict[str, int]]:

@@ -13,7 +13,7 @@ import pytesseract
 from PIL import Image
 from pytesseract import Output
 
-from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers
+from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers, live_boxes
 
 
 def segment_key(video_id: str, max_height: int, start_seconds: int = 0,
@@ -250,6 +250,18 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
     results = []
     total = len(frame_rows)
     for index, frame in enumerate(frame_rows, start=1):
+        boxes = live_boxes(cv2.imread(frame["frame_path"]))
+        if not boxes:
+            results.append({**frame, "scoreboard_format": "skipped", "ocr_text": "",
+                "ocr_confidence": 0., "match_number_candidate": None, "match_clock": None,
+                "match_clock_seconds": None, "match_clock_confidence": 0.,
+                "red_team_numbers": [], "blue_team_numbers": [], "team_number_ocr": "non-live layout",
+                "team_number_ocr_confidence": 0., "team_number_candidates": [],
+                "team_slots_raw": {}, "team_slots": {}, "team_number_source": "skipped",
+                "teams_complete": False})
+            if progress_callback:
+                progress_callback(index / total, index, total)
+            continue
         text, confidence = _ocr_text(frame["frame_path"])
         match_clock, match_clock_seconds, match_clock_confidence = _ocr_match_clock(
             frame["frame_path"]
@@ -260,6 +272,7 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
         alliance_teams = sorted(set(red_teams + blue_teams))
         results.append({
             **frame,
+            "scoreboard_format": "live",
             "ocr_text": text,
             "ocr_confidence": confidence,
             "match_number_candidate": detect_match_number(text),
