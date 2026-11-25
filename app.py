@@ -302,7 +302,11 @@ if ocr_rows:
                 **item,
                 "youtube_link": yt_timestamp_url(youtube_url, int(start)) if youtube_url else None,
             })
-        st.dataframe(pd.DataFrame(window_rows), use_container_width=True, height=320)
+        window_df = pd.DataFrame(window_rows)
+        columns = [c for c in window_df.columns if c != "team_numbers_seen"]
+        if "team_numbers_seen" in window_df.columns:
+            columns.insert(columns.index("youtube_link"), "team_numbers_seen")
+        st.dataframe(window_df[columns], use_container_width=True, height=320)
         st.caption("These are scoreboard-observation windows, not verified match start/end times. The scoreboard may show an upcoming match before play begins.")
     else:
         st.warning("No match numbers were recognized yet. Review the OCR text and scoreboard frame previews; the overlay may need a region-specific OCR pass or tuned text patterns.")
