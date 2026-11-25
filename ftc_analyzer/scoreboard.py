@@ -139,6 +139,54 @@ def live_boxes(frame):
             out[side+"2"] = (second[0],second[1],second[2],min(first[3],second[3]))
         if len(out)==5:
             return out
+    # Recover cells whose white contours merge into the camera footage.
+    for x,y,a,b in clocks:
+        bounded = mask.copy()
+        bounded[:y] = 0
+        bounded[y+b:] = 0
+        contours, _ = cv2.findContours(bounded, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cells = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c)>w*h*.001]
+        for side in ("red", "blue"):
+            candidates = [(u,v,p,q) for u,v,p,q in cells
+                          if .065*w<p<.19*w and .045*h<q<.14*h
+                          and (u+p<x if side=="red" else u>x+a)]
+            for first, second in combinations(sorted(candidates,key=lambda z:z[1]),2):
+                u,v,p,q = first
+                U,V,P,Q = second
+                if not (abs(u-U)<.025*w and abs(p-P)<.04*w
+                        and abs(q-Q)<.025*h and -.008*h<V-v-q<.025*h
+                        and abs(V+Q-y-b)<.025*h):
+                    continue
+                other = "blue" if side=="red" else "red"
+                inferred = [(round(2*(x+a/2)-u-p),v,p,q),
+                            (round(2*(x+a/2)-U-P),V,P,Q)]
+                out = {"clock":(x,y,a,b),side+"1":first,side+"2":second,
+                       other+"1":inferred[0],other+"2":inferred[1]}
+                valid = True
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                for slot in SLOTS:
+                    X,Y,W,H = out[slot]
+                    if X<0 or Y<0 or X+W>w or Y+H>h:
+                        valid = False
+                        break
+                    crop = hsv[Y:Y+H,X:X+W]
+                    white = (crop[:,:,1]<65)&(crop[:,:,2]>=180)
+                    digits = digit_crop(frame,slot,out[slot])
+                    gray = cv2.cvtColor(digits,cv2.COLOR_BGR2GRAY)
+                    if white.mean()<.60 or not .025<(gray<100).mean()<.40:
+                        valid = False
+                        break
+                if valid:
+                    # Verify alliance-colored score panels between cells and clock.
+                    red = out["red1"]
+                    blue = out["blue1"]
+                    left = hsv[y:y+b,red[0]+red[2]:x]
+                    right = hsv[y:y+b,x+a:blue[0]]
+                    if left.size and right.size:
+                        r = ((left[:,:,0]<12)|(left[:,:,0]>165))&(left[:,:,1]>100)
+                        bl = (right[:,:,0]>85)&(right[:,:,0]<135)&(right[:,:,1]>90)
+                        if r.mean()>.35 and bl.mean()>.35:
+                            return out
     return {}
 
 
