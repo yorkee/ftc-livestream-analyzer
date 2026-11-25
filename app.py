@@ -11,6 +11,7 @@ import yt_dlp
 from dotenv import load_dotenv
 
 from ftc_analyzer.first_api import fetch_event_schedule
+from ftc_analyzer.scoreboard import live_boxes, digit_crop, read_team_slots, SLOTS
 from ftc_analyzer.video_ocr import (
     download_video, extract_frames, run_ocr, build_observed_match_windows,
     save_ocr_results, format_timestamp, segment_key,
@@ -182,6 +183,26 @@ if frame_rows:
 
 st.divider()
 st.subheader("3. Read scoreboard text with OCR")
+if frame_rows:
+    with st.expander("Inspect a single frame / OCR crops"):
+        idx = st.selectbox("Frame", range(len(frame_rows)), format_func=lambda i: f"{frame_rows[i]['frame_index']} · {frame_rows[i]['timestamp']}")
+        if st.button("Inspect selected frame"):
+            image = cv2.imread(frame_rows[idx]["frame_path"])
+            boxes = live_boxes(image)
+            if not boxes:
+                st.warning("Skipped: no live-match scoreboard detected.")
+            else:
+                slots, raw, confidence = read_team_slots(image)
+                preview = image.copy()
+                for label, (x,y,w,h) in boxes.items():
+                    cv2.rectangle(preview,(x,y),(x+w,y+h),(0,255,0),2)
+                    cv2.putText(preview,label,(x,y+12),cv2.FONT_HERSHEY_SIMPLEX,.4,(0,128,0),1)
+                st.image(cv2.cvtColor(preview,cv2.COLOR_BGR2RGB))
+                for col, slot in zip(st.columns(4), SLOTS):
+                    col.image(cv2.cvtColor(digit_crop(image,slot,boxes[slot]),cv2.COLOR_BGR2RGB),caption=f"{slot}: {slots[slot]}")
+                st.write(raw)
+                st.caption(f"Mean OCR confidence: {confidence}")
+
 if st.button("Run OCR on captured frames", disabled=not frame_rows):
     try:
         known_teams = None
@@ -209,8 +230,8 @@ ocr_rows = st.session_state.ocr_rows
 if ocr_rows:
     st.subheader("OCR results")
     ocr_df = pd.DataFrame(ocr_rows)
-    display_columns = ["timestamp", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
-    st.dataframe(ocr_df[display_columns], use_container_width=True, height=420)
+    display_columns = ["timestamp", "scoreboard_format", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
+    st.dataframe(ocr_df.reindex(columns=display_columns), use_container_width=True, height=420)
     st.caption("Team numbers are read from dynamically detected red/blue overlay panels at the top or bottom of a frame. Temporal voting and optional FIRST match-schedule verification are reflected in team_number_source; team_slots_raw retains uncorrected reads in exports.")
     st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
                        file_name="ftc_ocr_results.csv", mime="text/csv")
