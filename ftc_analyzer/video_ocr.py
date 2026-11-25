@@ -13,6 +13,8 @@ import pytesseract
 from PIL import Image
 from pytesseract import Output
 
+from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers
+
 
 def download_video(url: str, video_id: str, video_dir: Path, max_height: int = 720) -> Path:
     """Download a single-file video stream suitable for local frame extraction."""
@@ -151,132 +153,17 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
 
 def _ocr_team_numbers_by_side(image_path: str,
                               known_team_numbers: Iterable[int] | None = None
-                              ) -> tuple[list[int], list[int], str, float]:
-    """Read team IDs from the four fixed alliance cells in the FTC banner.
+                              ) -> tuple[list[int], list[int], str, float, dict]:
+    """Find colored scoreboard panels and OCR their four team slots."""
+    image = cv2.imread(image_path)
+    if image is None:
+        return [], [], "could not open frame", 0.0, {}
+    slots, raw, confidence = read_team_slots(image, known_team_numbers)
+    red = [slots[key] for key in ("red1", "red2") if slots.get(key) is not None]
+    blue = [slots[key] for key in ("blue1", "blue2") if slots.get(key) is not None]
+    return red, blue, raw, confidence, slots
 
-    The banner can be at the top or bottom. Each of the four team cells is
-    OCR'd independently so alliance icons, scores, and clock digits are not
-    mixed into team IDs.
-    """
-    import numpy as np
 
-    image = Image.open(image_path).convert("RGB")
-    frame_width, frame_height = image.size
-    band_height = max(1, int(frame_height * 0.25))
-    regions = [
-        ("top", image.crop((0, 0, frame_width, band_height))),
-        ("bottom", image.crop((0, frame_height - band_height, frame_width, frame_height))),
-    ]
-
-    # Calibrated against both supplied Canopy/BioBuzz examples. Include the
-    # complete number glyphs while excluding the adjacent team-logo artwork.
-    x_cells = {
-        "red": (0.265, 0.335),
-        "blue": (0.670, 0.735),
-    }
-    y_cells = [
-        (0.35, 0.69),  # upper team-number cell
-        (0.66, 1.00),  # lower team-number cell
-    ]
-    roster = {int(n) for n in known_team_numbers} if known_team_numbers is not None else None
-    region_results = []
-    raw_words = []
-    all_confidences = []
-
-    for region_name, band in regions:
-        candidates = {"red": [], "blue": []}
-        for side, (x0, x1) in x_cells.items():
-            for row_index, (y0, y1) in enumerate(y_cells):
-                left = max(0, int(frame_width * x0))
-                right = min(frame_width, int(frame_width * x1))
-                top = max(0, int(band_height * y0))
-                bottom = min(band_height, int(band_height * y1))
-                cell = band.crop((left, top, right, bottom))
-                if cell.width == 0 or cell.height == 0:
-                    continue
-
-                # The source cell is small; enlarge it while preserving aspect.
-                cell = cell.resize((cell.width * 8, cell.height * 8))
-                gray = cv2.cvtColor(np.array(cell), cv2.COLOR_RGB2GRAY)
-                gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
-                variants = [
-                    ("gray", gray),
-                    ("otsu", cv2.threshold(
-                        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-                    )[1]),
-                ]
-
-                attempts = []
-                for variant_name, processed in variants:
-                    # PSM 6/7/8 cover the broadcast font's single-line and
-                    # single-word interpretations. Do not reject valid IDs
-                    # solely because Tesseract reports confidence 0.
-                    for psm in (6, 7, 8):
-                        data = pytesseract.image_to_data(
-                            processed,
-                            config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
-                            output_type=Output.DICT,
-                        )
-                        for token, conf in zip(data.get("text", []), data.get("conf", [])):
-                            token = token.strip()
-                            try:
-                                confidence = float(conf)
-                            except (TypeError, ValueError):
-                                confidence = -1.0
-                            if not token:
-                                continue
-                            raw_words.append(
-                                f"{region_name}:{side}{row_index + 1}:{variant_name}:psm{psm}:{token}"
-                            )
-                            if confidence >= 0:
-                                all_confidences.append(confidence)
-                            digits = re.sub(r"[^0-9]", "", token)
-                            if not re.fullmatch(r"\d{3,5}", digits):
-                                continue
-                            number = int(digits)
-                            if roster is not None and number not in roster:
-                                continue
-                            attempts.append((number, confidence, psm, variant_name))
-
-                if attempts:
-                    # Prefer higher confidence, then the more constrained
-                    # single-word mode when confidence scores are tied.
-                    best = max(attempts, key=lambda item: (item[1], item[2] == 8))
-                    candidates[side].append({
-                        "number": best[0],
-                        "confidence": best[1],
-                        "row": row_index,
-                    })
-
-        selected = {}
-        for side in ("red", "blue"):
-            side_items = sorted(
-                candidates[side],
-                key=lambda item: item["confidence"],
-                reverse=True,
-            )
-            values = []
-            for item in side_items:
-                if item["number"] not in values:
-                    values.append(item["number"])
-            selected[side] = values[:2]
-
-        count = len(selected["red"]) + len(selected["blue"])
-        confidence = sum(
-            item["confidence"]
-            for side in candidates.values()
-            for item in side
-        )
-        region_results.append((count, confidence, selected))
-
-    _, _, best_result = max(region_results, key=lambda result: (result[0], result[1]))
-    average = round(sum(all_confidences) / len(all_confidences), 1) if all_confidences else 0.0
-    return (
-        best_result["red"],
-        best_result["blue"],
-        " ".join(raw_words),
-        average,
-    )
 def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
     """Read the large mm:ss countdown in the center of the scoreboard banner."""
     import numpy as np
@@ -336,7 +223,7 @@ def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
 
 
 def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = None,
-            progress_callback=None) -> list[dict]:
+            progress_callback=None, schedule: list[dict] | None = None) -> list[dict]:
     results = []
     total = len(frame_rows)
     for index, frame in enumerate(frame_rows, start=1):
@@ -344,7 +231,7 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
         match_clock, match_clock_seconds, match_clock_confidence = _ocr_match_clock(
             frame["frame_path"]
         )
-        red_teams, blue_teams, team_raw, team_conf = _ocr_team_numbers_by_side(
+        red_teams, blue_teams, team_raw, team_conf, team_slots = _ocr_team_numbers_by_side(
             frame["frame_path"], known_team_numbers
         )
         alliance_teams = sorted(set(red_teams + blue_teams))
@@ -361,10 +248,14 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             "team_number_ocr": team_raw,
             "team_number_ocr_confidence": team_conf,
             "team_number_candidates": alliance_teams,
+            "team_slots_raw": team_slots,
+            "team_slots": team_slots.copy(),
+            "team_number_source": "single_frame_ocr",
+            "teams_complete": len(alliance_teams) == 4 and len(red_teams) == 2 and len(blue_teams) == 2,
         })
         if progress_callback:
             progress_callback(index / total, index, total)
-    return results
+    return stabilize_team_numbers(results, schedule)
 
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
     """Group scoreboard observations and backtrack from the stable teleop clock.
