@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from ftc_analyzer.scoreboard import (
-    detect_alliance_panels, read_team_slots, stabilize_team_numbers,
+    detect_alliance_panels, read_team_slots, stabilize_team_numbers, live_boxes,
 )
 
 
@@ -30,22 +30,22 @@ class ScoreboardTests(unittest.TestCase):
                 self.assertEqual(set(panels), {"red", "blue"})
                 self.assertEqual(panels["red"][1] >= 500, bottom)
 
-    def test_four_ids_read_from_top_and_bottom(self):
-        expected = {"red1": 30403, "red2": 24378,
-                    "blue1": 18664, "blue2": 7842}
+    def test_intro_layout_rejected(self):
         for bottom in (False, True):
-            with self.subTest(bottom=bottom):
-                slots, _, _ = read_team_slots(self.make_frame(bottom))
-                self.assertEqual(slots, expected)
+            self.assertEqual(live_boxes(self.make_frame(bottom)), {})
 
-    def test_original_sample_when_locally_available(self):
-        sample = Path(__file__).resolve().parent / "frame_00000129.jpg"
-        if not sample.exists():
-            self.skipTest("Optional original frame not present")
-        image = cv2.imread(str(sample))
-        slots, _, _ = read_team_slots(image)
-        self.assertEqual(slots, {"red1": 30403, "red2": 24378,
-                                 "blue1": 18664, "blue2": 7842})
+    def test_south_australia_fixtures(self):
+        root = Path(__file__).resolve().parent
+        positive = root / "frame_00000017.jpg"
+        negative = root / "frame_00000034.jpg"
+        if not positive.exists() or not negative.exists():
+            self.skipTest("Copy both South Australia frames into tests/")
+        image = cv2.imread(str(positive))
+        expected = {"red1":38987,"red2":22407,"blue1":38884,"blue2":18611}
+        for frame in (image, np.roll(image, 540, axis=0)):
+            slots, _, _ = read_team_slots(frame)
+            self.assertEqual(slots, expected)
+        self.assertEqual(live_boxes(cv2.imread(str(negative))), {})
 
     def test_temporal_voting_and_schedule_confirmation(self):
         schedule = [{"matchNumber": 3, "teams": [
