@@ -73,3 +73,7 @@ python -m unittest discover -s tests -v
 ```
 
 The tests create synthetic top/bottom scoreboards and exercise four-team OCR, per-slot temporal voting, and optional FIRST schedule verification. The additional original Athens Qualifier screenshot can be tested locally by placing it at `tests/frame_00000129.jpg` (not committed).
+
+## Quick test mode
+
+Run `streamlit run app.py` as usual. Select Quick test (default: first five minutes), Custom range, or Full video. Enter a start and duration in minutes, then click **Download selected video**, **Capture frames**, and **Run OCR on captured frames** independently. For fast iteration choose a two-second interval and a segment containing actual matches. Downloads are cached by video ID, requested resolution and range; frames and OCR exports also include the interval. Segment timestamps are offset to the original livestream. Actual cut precision depends on the source and FFmpeg. Existing full-video caches from older versions are not automatically reused. Download cancellation, pause/resume and automatic crop calibration are not implemented in this PR.
