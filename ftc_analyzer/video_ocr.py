@@ -16,10 +16,25 @@ from pytesseract import Output
 from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers
 
 
-def download_video(url: str, video_id: str, video_dir: Path, max_height: int = 720) -> Path:
+def segment_key(video_id: str, max_height: int, start_seconds: int = 0,
+                end_seconds: int | None = None) -> str:
+    if start_seconds < 0 or (end_seconds is not None and end_seconds <= start_seconds):
+        raise ValueError("Invalid video time range")
+    if end_seconds is None and start_seconds != 0:
+        raise ValueError("Full video must start at zero")
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", video_id)
+    if not safe_id:
+        raise ValueError("Missing video ID")
+    suffix = "full" if end_seconds is None else f"{start_seconds}-{end_seconds}"
+    return f"{safe_id}_{max_height}p_{suffix}"
+
+
+def download_video(url: str, video_id: str, video_dir: Path, max_height: int = 720,
+                   start_seconds: int = 0, end_seconds: int | None = None) -> Path:
     """Download a single-file video stream suitable for local frame extraction."""
     import yt_dlp
 
+    video_id = segment_key(video_id, max_height, start_seconds, end_seconds)
     video_dir.mkdir(parents=True, exist_ok=True)
     existing = [p for p in video_dir.glob(f"{video_id}.*")
                 if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
@@ -38,8 +53,14 @@ def download_video(url: str, video_id: str, video_dir: Path, max_height: int = 7
         "retries": 3,
         "continuedl": True,
     }
+    if end_seconds is not None:
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, [(start_seconds, end_seconds)])
+        opts["force_keyframes_at_cuts"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        status = ydl.download([url])
+        if status:
+            raise RuntimeError(f"Video download failed: {status}")
 
     downloaded = [p for p in video_dir.glob(f"{video_id}.*")
                    if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
@@ -50,7 +71,8 @@ def download_video(url: str, video_id: str, video_dir: Path, max_height: int = 7
 
 
 def extract_frames(video_path: Path, frame_dir: Path, interval_seconds: int = 10,
-                   max_width: int = 1280) -> list[dict]:
+                   max_width: int = 1280, start_offset_seconds: int = 0,
+                   duration_seconds: int | None = None) -> list[dict]:
     """Use FFmpeg to save one JPEG every N seconds and return frame metadata."""
     frame_dir.mkdir(parents=True, exist_ok=True)
     for old in frame_dir.glob("frame_*.jpg"):
@@ -61,7 +83,8 @@ def extract_frames(video_path: Path, frame_dir: Path, interval_seconds: int = 10
     vf = f"fps=1/{interval_seconds},{scale}"
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
-        "-vf", vf, "-q:v", "3", "-start_number", "0", str(pattern),
+        "-vf", vf, "-q:v", "3", "-start_number", "0",
+        *([] if duration_seconds is None else ["-t", str(duration_seconds)]), str(pattern),
     ]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
@@ -78,8 +101,8 @@ def extract_frames(video_path: Path, frame_dir: Path, interval_seconds: int = 10
         height, width = image.shape[:2]
         rows.append({
             "frame_index": index,
-            "timestamp_seconds": index * interval_seconds,
-            "timestamp": format_timestamp(index * interval_seconds),
+            "timestamp_seconds": start_offset_seconds + index * interval_seconds,
+            "timestamp": format_timestamp(start_offset_seconds + index * interval_seconds),
             "frame_path": str(path),
             "width": width,
             "height": height,
