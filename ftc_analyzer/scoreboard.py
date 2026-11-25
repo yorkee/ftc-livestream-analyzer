@@ -119,6 +119,34 @@ def live_boxes(frame):
     boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > w*h*.001]
     clocks = [(x,y,a,b) for x,y,a,b in boxes if abs(x+a/2-w/2)<w*.045
               and .07*w<a<.16*w and .10*h<b<.23*h and (y+b<h*.36 or y>h*.64)]
+    # Score panels provide a boundary independent of the white field timer.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    red_mask = ((hsv[:,:,0]<12)|(hsv[:,:,0]>165)) & (hsv[:,:,1]>105) & (hsv[:,:,2]>60)
+    blue_mask = (hsv[:,:,0]>85)&(hsv[:,:,0]<135)&(hsv[:,:,1]>90)&(hsv[:,:,2]>60)
+    anchors = []
+    for color, lo, hi in ((red_mask,.34,.445),(blue_mask,.555,.66)):
+        strip = color[:,int(w*lo):int(w*hi)]
+        active = (strip.mean(axis=1)>.55).astype(np.uint8)
+        active[int(h*.36):int(h*.64)] = 0
+        runs = np.flatnonzero(np.diff(np.r_[0,active,0]))
+        anchors.append([(int(t),int(e)) for t,e in zip(runs[::2],runs[1::2])
+                        if .10*h<e-t<.24*h])
+    for top,bottom in anchors[0]:
+        for bt,be in anchors[1]:
+            if abs(top-bt)>.015*h or abs(bottom-be)>.015*h:
+                continue
+            t = round((top+bt)/2)
+            e = round((bottom+be)/2)
+            # Recompute contours inside the color-defined band, not the camera.
+            clipped = mask.copy()
+            clipped[:t] = 0
+            clipped[e:] = 0
+            cs,_ = cv2.findContours(clipped,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+            for c in cs:
+                X,Y,W,H = cv2.boundingRect(c)
+                if abs(X+W/2-w/2)<w*.045 and .07*w<W<.16*w and H>.08*h:
+                    clocks.insert(0,(X,t,W,e-t))
+                    break
     for x,y,a,b in clocks:
         out = {"clock": (x,y,a,b)}
         for side in ("red", "blue"):
