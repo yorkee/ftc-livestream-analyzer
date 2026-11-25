@@ -12,6 +12,7 @@ import yt_dlp
 from dotenv import load_dotenv
 
 from ftc_analyzer.first_api import fetch_event_schedule
+from ftc_analyzer.frame_import import import_frame_folder
 from ftc_analyzer.video_ocr import (
     download_video, extract_frames, run_ocr, build_observed_match_windows,
     save_ocr_results, format_timestamp, segment_key,
@@ -43,12 +44,13 @@ with st.sidebar:
     st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
 st.subheader("1. Video and event")
-source = st.radio("Video source", ["YouTube", "Local video file"], horizontal=True)
+source = st.radio("Video source", ["YouTube", "Local video file", "Captured frame folder"], horizontal=True)
 local_path = None
 local_offset = 0
+frame_folder = None
 if source == "YouTube":
     youtube_url = st.text_input("Archived YouTube livestream URL", placeholder="https://www.youtube.com/watch?v=...")
-else:
+elif source == "Local video file":
     youtube_url = st.text_input("Original YouTube URL (optional, for match links)")
     method = st.radio("Local file input", ["Drag and drop", "Existing file path"], horizontal=True)
     if method == "Drag and drop":
@@ -72,6 +74,21 @@ else:
                 st.warning("Enter a valid local video file path.")
     local_offset = round(st.number_input("Original livestream offset (seconds)", min_value=0, value=0, step=1))
     st.caption("For a previously downloaded segment, enter its original start time. For a complete video, leave this at zero. Large files are best opened by path, avoiding upload limits and copying.")
+
+else:
+    youtube_url = st.text_input("Original YouTube URL (optional, for match links)")
+    folders = sorted(p for p in FRAME_DIR.iterdir() if p.is_dir())
+    selected = st.selectbox("Previously captured folder", ["Enter another folder"] + [str(p) for p in folders])
+    entered = st.text_input("Frame folder path", placeholder="data/frames/...") if selected == "Enter another folder" else selected
+    if entered:
+        candidate = Path(entered).expanduser().resolve()
+        if candidate.is_dir():
+            frame_folder = candidate
+        else:
+            st.warning("Folder does not exist.")
+    interval = int(st.number_input("Original frame interval (seconds)", min_value=1, value=int(interval), step=1))
+    local_offset = int(st.number_input("Original livestream offset (seconds)", min_value=0, value=0, step=1))
+    st.caption("Use the original capture interval and segment start. Numbered frame filenames preserve gaps; no images are copied or modified.")
 
 c1, c2, c3 = st.columns(3)
 season = c1.number_input("FTC season", min_value=2023, max_value=2035, value=2026, step=1)
@@ -159,7 +176,9 @@ if mode != "Full video":
     st.caption(f"Selected segment: {format_timestamp(start_seconds)} to {format_timestamp(end_seconds)}. Only this section is requested from YouTube.")
 elif source == "YouTube":
     st.warning("Full livestream downloads may take a long time and use several GB.")
-if source == "Local video file":
+if source == "Captured frame folder":
+    key = "frames_" + hashlib.sha256(f"{frame_folder}:{local_offset}".encode()).hexdigest()[:24] if frame_folder else None
+elif source == "Local video file":
     start_seconds = local_offset
     if local_path:
         stat = local_path.stat()
@@ -192,7 +211,20 @@ if source == "YouTube" and st.button("Download selected video", type="primary", 
 
 if st.session_state.video_path:
     st.caption(f"Ready: {st.session_state.video_path}")
-if st.button("Capture frames", disabled=not st.session_state.video_path):
+if source == "Captured frame folder":
+    if st.button("Import captured frames", disabled=frame_folder is None):
+        try:
+            with st.spinner("Reading existing images..."):
+                rows, skipped = import_frame_folder(frame_folder, interval, local_offset)
+            st.session_state.frame_rows = rows
+            st.session_state.ocr_rows = None
+            st.session_state.match_windows = None
+            st.success(f"Imported {len(rows):,} frames without copying.")
+            if skipped:
+                st.warning(f"Skipped {skipped} unreadable images.")
+        except Exception as exc:
+            st.exception(exc)
+elif st.button("Capture frames", disabled=not st.session_state.video_path):
     try:
         frame_dir = FRAME_DIR / f"{key}_{interval}s"
         with st.spinner("Extracting frames..."):
