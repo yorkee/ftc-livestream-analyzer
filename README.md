@@ -4,9 +4,9 @@
 - Accepts an archived YouTube livestream URL.
 - Downloads a video stream (no audio extraction or transcription).
 - Uses FFmpeg to capture one frame every 10 seconds by default; 5, 15, and 30 seconds are configurable.
-- Runs Tesseract OCR on every captured frame.
+- Runs Tesseract OCR on every captured frame. Detects matching red and blue alliance panels at the **top or bottom** of the picture, then reads exactly four ordered team slots instead of guessing numbers from the whole frame.
 - Attempts to recognize match-number labels and event team numbers from OCR text.
-- Optionally fetches the FIRST hybrid schedule to filter team-number candidates against the event roster.
+- Votes on each alliance/team slot across consecutive frames belonging to the same observed match. An optional FIRST hybrid schedule filters OCR candidates and can confirm or correct the four official teams when the match has corroborating OCR evidence; uncertain results remain unresolved.
 - Groups consecutive frames that show the same match number into **observed scoreboard windows**.
 - Saves frame images and OCR results locally and provides CSV/JSON exports.
 
@@ -61,7 +61,15 @@ These files can become large, especially the downloaded video and frame director
 - Whisper/faster-whisper and PyAV are not dependencies in this video-first version.
 - Install `tesseract-ocr` with apt; the Python `pytesseract` package is only a wrapper.
 - YouTube may not offer the requested resolution as a single-file stream. yt-dlp selects the best available compatible format.
-- OCR accuracy depends on scoreboard layout, resolution, motion, contrast, and text size. Different events may need different OCR regions or preprocessing.
+- Color panel detection expects the broadcast to use recognizable red and blue horizontal alliance panels. Different broadcasters may use different colors and team-number column positions. The four slots are fixed, but their content is not invented when OCR or schedule validation is inconclusive.
 - A 10-second sample interval gives roughly 15 frames during a 2:30 match, but match boundaries can fall between samples. We will refine actual start/end timestamps after validating scoreboard state/clock detection.
 - FIRST API data is generally available after an event concludes and syncs. The app uses HTTP Basic authentication and FIRST asks applications displaying API data to link to its API information page.
 - Use only videos you are authorized to access. YouTube availability and download restrictions can vary.
+
+## Testing team-number detection
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests create synthetic top/bottom scoreboards and exercise four-team OCR, per-slot temporal voting, and optional FIRST schedule verification. The additional original Athens Qualifier screenshot can be tested locally by placing it at `tests/frame_00000129.jpg` (not committed).

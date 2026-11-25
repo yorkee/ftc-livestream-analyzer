@@ -167,7 +167,7 @@ if st.button("Run OCR on captured frames", disabled=not frame_rows):
         def update_progress(fraction, current, total):
             progress.progress(fraction, text=f"Reading frame {current:,} of {total:,}...")
         with st.spinner("Running Tesseract OCR on each captured frame..."):
-            ocr_rows = run_ocr(frame_rows, known_teams, update_progress)
+            ocr_rows = run_ocr(frame_rows, known_teams, update_progress, schedule=schedule)
         st.session_state.ocr_rows = ocr_rows
         st.session_state.match_windows = build_observed_match_windows(ocr_rows, int(interval))
         video_id = get_video_id(youtube_url)
@@ -180,8 +180,9 @@ ocr_rows = st.session_state.ocr_rows
 if ocr_rows:
     st.subheader("OCR results")
     ocr_df = pd.DataFrame(ocr_rows)
-    display_columns = ["timestamp", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
+    display_columns = ["timestamp", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
     st.dataframe(ocr_df[display_columns], use_container_width=True, height=420)
+    st.caption("Team numbers are read from dynamically detected red/blue overlay panels at the top or bottom of a frame. Temporal voting and optional FIRST match-schedule verification are reflected in team_number_source; team_slots_raw retains uncorrected reads in exports.")
     st.download_button("Download OCR results (CSV)", ocr_df.to_csv(index=False),
                        file_name="ftc_ocr_results.csv", mime="text/csv")
     st.download_button("Download OCR results (JSON)", json.dumps(ocr_rows, indent=2),
