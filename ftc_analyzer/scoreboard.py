@@ -199,7 +199,7 @@ def _schedule_slots(schedule: list[dict] | None) -> dict[int, dict[str, int]]:
             if len(options) == 1 or all(option == options[0] for option in options)}
 
 
-def stabilize_team_numbers(rows: list[dict], schedule: list[dict] | None = None) -> list[dict]:
+def stabilize_team_numbers(rows: list[dict], schedule: list[dict] | None = None, *, enable_voting=True) -> list[dict]:
     """Vote within consecutive match windows, with optional schedule verification.
 
     A unique official schedule entry is used only when independent OCR evidence
@@ -238,14 +238,14 @@ def stabilize_team_numbers(rows: list[dict], schedule: list[dict] | None = None)
         number = matches[0]["match_number_candidate"]
         voted: dict[str, int] = {}
         for slot in SLOTS:
-            votes = Counter(row.get("team_slots_raw", {}).get(slot)
+            votes = Counter(row.get("team_slots_filtered", row.get("team_slots_raw", {})).get(slot)
                             for row in matches if row.get("team_slots_raw", {}).get(slot) is not None)
             if not votes:
                 continue
             best, count = votes.most_common(1)[0]
             if sum(1 for n in votes if votes[n] == count) > 1:
                 continue  # Never break a tie arbitrarily.
-            if count >= 2 or (len(matches) == 1 and len(votes) == 1):
+            if len(votes) == 1 or count >= 2:
                 voted[slot] = best
 
         official = expected.get(number)
@@ -262,6 +262,13 @@ def stabilize_team_numbers(rows: list[dict], schedule: list[dict] | None = None)
             resolved = voted
             source = "temporal_ocr" if voted else "unresolved"
         for row in matches:
+            individual = {k:v for k,v in row.get("team_slots_filtered", row.get("team_slots_raw", {})).items() if v is not None}
+            if not enable_voting:
+                official_agreements = sum(individual.get(k)==v for k,v in (official or {}).items())
+                conflicts = sum(k in individual and individual[k]!=v for k,v in (official or {}).items())
+                resolved = official.copy() if official and official_agreements >= 2 and not conflicts else individual
+                source = "first_schedule_verified" if official and resolved == official and official_agreements >= 2 and not conflicts else "single_frame_ocr"
+            row["team_slots_voted"] = {slot: (voted if enable_voting else individual).get(slot) for slot in SLOTS}
             row["team_slots"] = {slot: resolved.get(slot) for slot in SLOTS}
             row["red_team_numbers"] = [resolved[slot] for slot in ("red1", "red2") if slot in resolved]
             row["blue_team_numbers"] = [resolved[slot] for slot in ("blue1", "blue2") if slot in resolved]
