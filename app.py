@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from ftc_analyzer.first_api import fetch_event_schedule
 from ftc_analyzer.video_ocr import (
     download_video, extract_frames, run_ocr, build_observed_match_windows,
-    save_ocr_results, format_timestamp,
+    save_ocr_results, format_timestamp, segment_key,
 )
 
 load_dotenv()
@@ -37,7 +37,7 @@ with st.sidebar:
     st.caption("Credentials are used only by this local app. Do not share your .env file.")
     st.divider()
     st.header("Frame sampling")
-    interval = st.select_slider("Capture one frame every", options=[5, 10, 15, 30], value=10, format_func=lambda x: f"{x} seconds")
+    interval = st.select_slider("Capture one frame every", options=[1, 2, 5, 10, 15, 30], value=10, format_func=lambda x: f"{x} seconds")
     max_height = st.selectbox("Maximum video resolution", [480, 720, 1080], index=1)
     st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
@@ -117,22 +117,51 @@ if info:
 
 st.divider()
 st.subheader("2. Download video and capture frames")
-st.info(f"The analyzer will sample one frame every {interval} seconds. A 2.5-minute match should therefore have about 15 sampled frames, depending on where its scoreboard appears.")
-if st.button("Download video + capture frames", type="primary", disabled=not youtube_url):
+mode = st.radio("Download mode", ["Quick test", "Custom range", "Full video"], horizontal=True)
+start_seconds = 0
+end_seconds = None
+if mode != "Full video":
+    c_start, c_length = st.columns(2)
+    start_minutes = c_start.number_input("Start (minutes into livestream)", min_value=0.0, value=0.0, step=0.5)
+    length_minutes = c_length.number_input("Duration (minutes)", min_value=0.5, value=5.0, step=0.5)
+    start_seconds = round(start_minutes * 60)
+    end_seconds = start_seconds + round(length_minutes * 60)
+    st.caption(f"Selected segment: {format_timestamp(start_seconds)} to {format_timestamp(end_seconds)}. Only this section is requested from YouTube.")
+else:
+    st.warning("Full livestream downloads may take a long time and use several GB.")
+key = segment_key(get_video_id(youtube_url), int(max_height), start_seconds, end_seconds) if youtube_url else None
+# Do not show or process frames from a different video, range or interval.
+selection = (key, int(interval))
+if st.session_state.get("selection") != selection:
+    st.session_state.selection = selection
+    st.session_state.video_path = None
+    st.session_state.frame_rows = None
+    st.session_state.ocr_rows = None
+    st.session_state.match_windows = None
+st.info(f"Sampling every {interval} seconds. Cached downloads are reused automatically.")
+if st.button("Download selected video", type="primary", disabled=not youtube_url):
     try:
-        video_id = get_video_id(youtube_url)
-        video_progress = st.progress(0, text="Preparing video download...")
-        with st.spinner("Downloading the video stream. Multi-hour livestreams can be several gigabytes..."):
-            video_path = download_video(youtube_url, video_id, VIDEO_DIR, int(max_height))
-        st.session_state.video_path = str(video_path)
-        video_progress.progress(1.0, text=f"Video ready: {video_path.name}")
-        frame_dir = FRAME_DIR / video_id
-        with st.spinner(f"Extracting one frame every {interval} seconds with FFmpeg..."):
-            frames = extract_frames(video_path, frame_dir, int(interval))
+        with st.spinner("Downloading selected video range..."):
+            path = download_video(youtube_url, get_video_id(youtube_url), VIDEO_DIR,
+                                  int(max_height), start_seconds, end_seconds)
+        st.session_state.video_path = str(path)
+        st.success(f"Video ready: {path.name}")
+    except Exception as exc:
+        st.exception(exc)
+
+if st.session_state.video_path:
+    st.caption(f"Ready: {st.session_state.video_path}")
+if st.button("Capture frames", disabled=not st.session_state.video_path):
+    try:
+        frame_dir = FRAME_DIR / f"{key}_{interval}s"
+        with st.spinner("Extracting frames..."):
+            frames = extract_frames(Path(st.session_state.video_path), frame_dir, int(interval),
+                                    start_offset_seconds=start_seconds,
+                                    duration_seconds=None if end_seconds is None else end_seconds-start_seconds)
         st.session_state.frame_rows = frames
         st.session_state.ocr_rows = None
         st.session_state.match_windows = None
-        st.success(f"Captured {len(frames):,} frames. They are saved under data/frames/{video_id}/.")
+        st.success(f"Captured {len(frames):,} frames.")
     except Exception as exc:
         st.exception(exc)
 
@@ -170,8 +199,8 @@ if st.button("Run OCR on captured frames", disabled=not frame_rows):
             ocr_rows = run_ocr(frame_rows, known_teams, update_progress, schedule=schedule)
         st.session_state.ocr_rows = ocr_rows
         st.session_state.match_windows = build_observed_match_windows(ocr_rows, int(interval))
-        video_id = get_video_id(youtube_url)
-        save_ocr_results(ocr_rows, OCR_DIR / f"{video_id}.json", OCR_DIR / f"{video_id}.csv")
+        export_key = f"{key}_{interval}s"
+        save_ocr_results(ocr_rows, OCR_DIR / f"{export_key}.json", OCR_DIR / f"{export_key}.csv")
         st.success(f"OCR complete: processed {len(ocr_rows):,} frames. Results saved under data/ocr/.")
     except Exception as exc:
         st.exception(exc)
