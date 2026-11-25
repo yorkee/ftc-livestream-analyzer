@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 import json
 from pathlib import Path
@@ -42,7 +43,36 @@ with st.sidebar:
     st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
 st.subheader("1. Video and event")
-youtube_url = st.text_input("Archived YouTube livestream URL", placeholder="https://www.youtube.com/watch?v=...")
+source = st.radio("Video source", ["YouTube", "Local video file"], horizontal=True)
+local_path = None
+local_offset = 0
+if source == "YouTube":
+    youtube_url = st.text_input("Archived YouTube livestream URL", placeholder="https://www.youtube.com/watch?v=...")
+else:
+    youtube_url = st.text_input("Original YouTube URL (optional, for match links)")
+    method = st.radio("Local file input", ["Drag and drop", "Existing file path"], horizontal=True)
+    if method == "Drag and drop":
+        upload = st.file_uploader("Drop a downloaded video here", type=["mp4","webm","mkv","mov","avi","m4v"])
+        if upload is not None:
+            buffer = upload.getbuffer()
+            digest = hashlib.sha256(buffer).hexdigest()
+            local_path = VIDEO_DIR / f"upload_{digest}{Path(upload.name).suffix.lower()}"
+            if not local_path.exists() or local_path.stat().st_size != upload.size:
+                temporary = local_path.with_suffix(".part")
+                with temporary.open("wb") as handle:
+                    handle.write(buffer)
+                temporary.replace(local_path)
+    else:
+        entered = st.text_input("Existing video path", placeholder="/home/user/Downloads/match.mp4")
+        if entered:
+            candidate = Path(entered).expanduser().resolve()
+            if candidate.is_file() and candidate.suffix.lower() in {".mp4",".webm",".mkv",".mov",".avi",".m4v"}:
+                local_path = candidate
+            else:
+                st.warning("Enter a valid local video file path.")
+    local_offset = round(st.number_input("Original livestream offset (seconds)", min_value=0, value=0, step=1))
+    st.caption("For a previously downloaded segment, enter its original start time. For a complete video, leave this at zero. Large files are best opened by path, avoiding upload limits and copying.")
+
 c1, c2, c3 = st.columns(3)
 season = c1.number_input("FTC season", min_value=2023, max_value=2035, value=2026, step=1)
 event_code = c2.text_input("FIRST event code", placeholder="e.g. MIxxxx")
@@ -96,7 +126,7 @@ if "ocr_rows" not in st.session_state:
 if "match_windows" not in st.session_state:
     st.session_state.match_windows = None
 
-if st.button("Inspect YouTube video", type="secondary", disabled=not youtube_url):
+if source == "YouTube" and st.button("Inspect YouTube video", type="secondary", disabled=not youtube_url):
     try:
         with st.spinner("Reading YouTube metadata..."):
             info = get_video_info(youtube_url)
@@ -107,7 +137,7 @@ if st.button("Inspect YouTube video", type="secondary", disabled=not youtube_url
         st.error(f"Could not inspect this video: {exc}")
 
 info = st.session_state.video_info
-if info:
+if info and source == "YouTube" and st.session_state.get("video_url") == youtube_url:
     st.markdown(f"**{info.get('title', 'Untitled')}**")
     m1, m2, m3 = st.columns(3)
     duration = int(info.get("duration") or 0)
@@ -117,7 +147,7 @@ if info:
 
 st.divider()
 st.subheader("2. Download video and capture frames")
-mode = st.radio("Download mode", ["Quick test", "Custom range", "Full video"], horizontal=True)
+mode = st.radio("Download mode", ["Quick test", "Custom range", "Full video"], horizontal=True) if source == "YouTube" else "Full video"
 start_seconds = 0
 end_seconds = None
 if mode != "Full video":
@@ -127,9 +157,18 @@ if mode != "Full video":
     start_seconds = round(start_minutes * 60)
     end_seconds = start_seconds + round(length_minutes * 60)
     st.caption(f"Selected segment: {format_timestamp(start_seconds)} to {format_timestamp(end_seconds)}. Only this section is requested from YouTube.")
-else:
+elif source == "YouTube":
     st.warning("Full livestream downloads may take a long time and use several GB.")
-key = segment_key(get_video_id(youtube_url), int(max_height), start_seconds, end_seconds) if youtube_url else None
+if source == "Local video file":
+    start_seconds = local_offset
+    if local_path:
+        stat = local_path.stat()
+        identity = f"{local_path}:{stat.st_size}:{stat.st_mtime_ns}:{local_offset}"
+        key = "local_" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+    else:
+        key = None
+else:
+    key = segment_key(get_video_id(youtube_url), int(max_height), start_seconds, end_seconds) if youtube_url else None
 # Do not show or process frames from a different video, range or interval.
 selection = (key, int(interval))
 if st.session_state.get("selection") != selection:
@@ -139,7 +178,9 @@ if st.session_state.get("selection") != selection:
     st.session_state.ocr_rows = None
     st.session_state.match_windows = None
 st.info(f"Sampling every {interval} seconds. Cached downloads are reused automatically.")
-if st.button("Download selected video", type="primary", disabled=not youtube_url):
+if source == "Local video file":
+    st.session_state.video_path = str(local_path) if local_path else None
+if source == "YouTube" and st.button("Download selected video", type="primary", disabled=not youtube_url):
     try:
         with st.spinner("Downloading selected video range..."):
             path = download_video(youtube_url, get_video_id(youtube_url), VIDEO_DIR,
@@ -227,7 +268,7 @@ if ocr_rows:
                 start = int(item["first_seen_seconds"])
             window_rows.append({
                 **item,
-                "youtube_link": yt_timestamp_url(youtube_url, int(start)),
+                "youtube_link": yt_timestamp_url(youtube_url, int(start)) if youtube_url else None,
             })
         st.dataframe(pd.DataFrame(window_rows), use_container_width=True, height=320)
         st.caption("These are scoreboard-observation windows, not verified match start/end times. The scoreboard may show an upcoming match before play begins.")
