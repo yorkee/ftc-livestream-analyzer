@@ -32,13 +32,26 @@ class CompetitionQueue:
         return response.json()
 
     def list_jobs(self, status=None, limit=200, offset=0):
-        params = {"select": "*,ftc_events(date_start,date_end)", "order": "priority.desc,created_at.asc,id.asc",
+        params = {"select": "*", "order": "priority.desc,created_at.asc,id.asc",
                   "limit": limit, "offset": offset}
         if status:
             params["status"] = "eq." + status
         rows = self._request("GET", params)
+        events = {}
+        for year in {row["season_year"] for row in rows}:
+            codes = sorted({row["event_code"] for row in rows if row["season_year"] == year})
+            for i in range(0, len(codes), 50):
+                import json
+                response = requests.get(self.url.rsplit("/", 1)[0] + "/ftc_events",
+                    params={"select": "event_code,date_start,date_end", "season_year": f"eq.{year}",
+                            "event_code": "in.(" + ",".join(json.dumps(code) for code in codes[i:i+50]) + ")"},
+                    headers=self.headers, timeout=30)
+                if not response.ok:
+                    raise RuntimeError(f"Event dates API returned HTTP {response.status_code}")
+                for event in response.json():
+                    events[(year, event["event_code"])] = event
         for row in rows:
-            event = row.pop("ftc_events", None) or {}
+            event = events.get((row["season_year"], row["event_code"]), {})
             row["date_start"] = event.get("date_start")
             row["date_end"] = event.get("date_end")
         return rows
