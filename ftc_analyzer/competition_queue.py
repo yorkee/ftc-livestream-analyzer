@@ -32,11 +32,16 @@ class CompetitionQueue:
         return response.json()
 
     def list_jobs(self, status=None, limit=200, offset=0):
-        params = {"select": "*", "order": "priority.desc,created_at.asc,id.asc",
+        params = {"select": "*,ftc_events(date_start,date_end)", "order": "priority.desc,created_at.asc,id.asc",
                   "limit": limit, "offset": offset}
         if status:
             params["status"] = "eq." + status
-        return self._request("GET", params)
+        rows = self._request("GET", params)
+        for row in rows:
+            event = row.pop("ftc_events", None) or {}
+            row["date_start"] = event.get("date_start")
+            row["date_end"] = event.get("date_end")
+        return rows
 
     def _patch(self, filters, values):
         rows = self._request("PATCH", filters, {**values, "updated_at": now().isoformat()})
