@@ -45,6 +45,7 @@ with st.sidebar:
     st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
 from ftc_analyzer.competition_queue_ui import render_competition_queue
+from ftc_analyzer.match_windows_ui import render_match_windows
 
 manual_tab, queue_tab = st.tabs(["Manual Analyzer", "Competition Queue"])
 with queue_tab:
@@ -329,26 +330,7 @@ with manual_tab:
         st.download_button("Download OCR results (JSON)", json.dumps(ocr_rows, indent=2),
                            file_name="ftc_ocr_results.json", mime="application/json")
 
-        st.subheader("Candidate match windows")
-        windows = st.session_state.match_windows or []
-        if windows:
-            window_rows = []
-            for item in windows:
-                start = item.get("start_offset_seconds")
-                if start is None:
-                    start = int(item["first_seen_seconds"])
-                window_rows.append({
-                    **item,
-                    "youtube_link": yt_timestamp_url(youtube_url, int(start)) if youtube_url else None,
-                })
-            window_df = pd.DataFrame(window_rows)
-            columns = [c for c in window_df.columns if c != "team_numbers_seen"]
-            if "team_numbers_seen" in window_df.columns:
-                columns.insert(columns.index("youtube_link"), "team_numbers_seen")
-            st.dataframe(window_df[columns], use_container_width=True, height=320)
-            st.caption("These are scoreboard-observation windows, not verified match start/end times. The scoreboard may show an upcoming match before play begins.")
-        else:
-            st.warning("No match numbers were recognized yet. Review the OCR text and scoreboard frame previews; the overlay may need a region-specific OCR pass or tuned text patterns.")
+        render_match_windows(st.session_state.match_windows or [], youtube_url, "manual")
 
     with st.expander("Troubleshooting and limitations"):
         st.markdown("""
