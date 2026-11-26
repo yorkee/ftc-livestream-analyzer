@@ -45,9 +45,11 @@ with st.sidebar:
     st.caption("10 seconds is the initial default. This downloads video and samples frames; audio transcription is not used.")
 
 from ftc_analyzer.competition_queue_ui import render_competition_queue
-from ftc_analyzer.match_windows_ui import render_match_windows
+from ftc_analyzer.match_windows_ui import render_match_windows, render_windows_import
 
-manual_tab, queue_tab = st.tabs(["Manual Analyzer", "Competition Queue"])
+manual_tab, queue_tab, viewer_tab = st.tabs(["Manual Analyzer", "Competition Queue", "Match Windows Viewer"])
+with viewer_tab:
+    render_windows_import()
 with queue_tab:
     render_competition_queue(DATA_DIR, interval, max_height)
 with manual_tab:
