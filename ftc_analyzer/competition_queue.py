@@ -104,52 +104,112 @@ class CompetitionQueue:
                             "locked_at": None, "lease_expires_at": None})
 
 
-def process_job(queue, selected, data_dir, interval=10, max_height=720, notify=lambda p, s: None):
-    """Run existing OCR pipeline; save local artifacts only, never publish matches."""
+def process_job(queue, selected, data_dir, interval=10, max_height=720,
+                notify=lambda p, s: None, preview=lambda rows, windows, stats: None):
+    """Checkpoint raw OCR locally; never publish unverified matches."""
+    import json
     import re
+    import time
+    import traceback
+    import pytesseract
     from .video_ocr import download_video, extract_frames, run_ocr, build_observed_match_windows, save_ocr_results
     video_id = selected.get("youtube_video_id") or ""
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ValueError("Job needs a valid normalized YouTube ID.")
     job = queue.claim(selected)
     try:
-        root = Path(data_dir) / "competition_queue" / str(job["id"]) / str(job["attempts"])
-        for folder in ("videos", "frames", "ocr"):
-            (root / folder).mkdir(parents=True, exist_ok=True)
+        base = Path(data_dir).resolve() / "competition_queue" / str(job["id"])
+        root = base / str(job["attempts"])
+        cache = base / f"cache_v1_{video_id}_{interval}_{max_height}"
+        for folder in (cache / "videos", cache / "frames", root / "ocr"):
+            folder.mkdir(parents=True, exist_ok=True)
+        def atomic(path, value):
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
+            tmp.replace(path)
         def report(p, message):
             queue.progress(job, p)
             notify(p, message)
-        report(5, "Downloading full recording")
+        report(5, "Downloading or reusing recording")
+        # Existing downloader validates the expected filename and reuses completed files.
         path = download_video("https://www.youtube.com/watch?v=" + video_id, video_id,
-                              root / "videos", max_height, 0, None)
-        report(25, "Capturing frames")
-        frames = extract_frames(path, root / "frames", interval, start_offset_seconds=0,
-                                duration_seconds=None)
-        if not frames:
-            raise RuntimeError("No frames captured")
-        report(45, "Running OCR")
-        last = 45
-        def callback(fraction, current, total):
-            nonlocal last
-            percent = min(95, 45 + int(50 * fraction))
-            if percent > last:
-                report(percent, f"OCR frame {current}/{total}")
-                last = percent
-        rows = run_ocr(frames, None, callback, schedule=None,
-                       enable_voting=False, enable_schedule=False)
-        windows = build_observed_match_windows(rows, interval)
-        import json
+                              cache / "videos", max_height, 0, None)
+        report(25, "Capturing or reusing frames")
+        manifest = cache / "frames.json"
+        frames = json.loads(manifest.read_text()) if manifest.exists() else []
+        if not frames or not all(Path(f["frame_path"]).is_file() for f in frames):
+            checkpoint = cache / "checkpoint.json"
+            checkpoint.unlink(missing_ok=True)
+            frames = extract_frames(path, cache / "frames", interval, start_offset_seconds=0,
+                                    duration_seconds=None)
+            atomic(manifest, frames)
+        checkpoint = cache / "checkpoint.json"
+        rows = json.loads(checkpoint.read_text()) if checkpoint.exists() else []
+        if len(rows) > len(frames) or any(r["frame_index"] != f["frame_index"]
+                                         for r, f in zip(rows, frames)):
+            raise RuntimeError("Checkpoint does not match frame manifest")
+        initial = len(rows)
+        started = time.monotonic()
+        consecutive_errors = 0
+        def snapshot():
+            atomic(checkpoint, rows)
+            windows = build_observed_match_windows(rows, interval)
+            for w in windows:
+                offset = w.get("start_offset_seconds")
+                if offset is None:
+                    offset = w["first_seen_seconds"]
+                w["youtube_link"] = f"https://www.youtube.com/watch?v={video_id}&t={int(offset)}s"
+                w.update(season_year=job["season_year"], event_code=job["event_code"],
+                         youtube_video_id=video_id)
+            atomic(root / "ocr/windows.json", windows)
+            failed = sum(bool(r.get("ocr_error")) for r in rows)
+            speed = (len(rows) - initial) / max(time.monotonic() - started, 0.001)
+            stats = {"processed": len(rows), "total": len(frames), "failed": failed,
+                     "successful": len(rows) - failed, "checkpoint": len(rows),
+                     "frames_per_second": round(speed, 2),
+                     "eta_seconds": round((len(frames) - len(rows)) / speed) if speed else None}
+            preview(rows, windows, stats)
+            return windows, stats
+        report(45 + int(50 * len(rows) / len(frames)), f"Resuming OCR at {len(rows)}/{len(frames)}")
+        snapshot()
+        for frame in frames[len(rows):]:
+            try:
+                for attempt in range(2):
+                    try:
+                        result = run_ocr([frame], None, schedule=None,
+                                         enable_voting=False, enable_schedule=False)[0]
+                        break
+                    except pytesseract.TesseractError:
+                        if attempt:
+                            raise
+                        time.sleep(1)
+                consecutive_errors = 0
+            except pytesseract.TesseractError as exc:
+                consecutive_errors += 1
+                traceback.print_exc()
+                if consecutive_errors >= 3:
+                    snapshot()
+                    raise RuntimeError(f"Three consecutive OCR errors; last frame {frame['frame_index']}: {exc}") from exc
+                result = {**frame, "scoreboard_format": "error", "ocr_error": str(exc),
+                          "match_number_candidate": None}
+            rows.append(result)
+            if len(rows) % 50 == 0 or len(rows) == len(frames):
+                snapshot()
+                report(45 + int(50 * len(rows) / len(frames)), f"OCR frame {len(rows)}/{len(frames)}")
+            else:
+                notify(45 + int(50 * len(rows) / len(frames)), f"OCR frame {len(rows)}/{len(frames)}")
+        windows, stats = snapshot()
         save_ocr_results(rows, root / "ocr/results.json", root / "ocr/results.csv")
-        (root / "ocr/windows.json").write_text(json.dumps(windows, indent=2), encoding="utf-8")
         summary = {"frames": len(frames), "ocr_rows": len(rows), "candidate_windows": len(windows),
-                   "artifact_dir": str(root / "ocr"), "published": False,
-                   "interval_seconds": interval, "max_height": max_height}
+                   "failed_frames": stats["failed"], "artifact_dir": str(root / "ocr"),
+                   "published": False, "interval_seconds": interval, "max_height": max_height}
         queue.finish(job, summary=summary)
         notify(100, "Completed; results saved locally")
         return summary
     except Exception as exc:
+        traceback.print_exc()
         try:
-            queue.finish(job, error=type(exc).__name__ + ": processing failed; see local application error")
+            queue.finish(job, error=f"{type(exc).__name__}: {exc}")
         except Exception:
-            pass
+            traceback.print_exc()
         raise
