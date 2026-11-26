@@ -17,9 +17,10 @@ def render_competition_queue(data_dir, interval, max_height):
     if not jobs:
         st.info("No jobs on this page.")
         return
-    fields = ("id", "season_year", "event_code", "event_name", "video_url", "status",
+    fields = ("id", "season_year", "event_code", "event_name", "date_start", "date_end", "video_url", "status",
               "priority", "attempts", "progress_percent", "lease_expires_at", "last_error")
-    st.dataframe([{k: job.get(k) for k in fields} for job in jobs], use_container_width=True)
+    st.dataframe([{k: job.get(k) for k in fields} for job in jobs], use_container_width=True,
+                 column_config={"date_start": "Event start", "date_end": "Event end"})
     by_id = {job["id"]: job for job in jobs}
     selected = st.selectbox("Select job", list(by_id),
                             format_func=lambda i: f"#{i} · {by_id[i]['event_code']} · {by_id[i]['status']}")
