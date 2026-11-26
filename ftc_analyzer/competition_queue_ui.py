@@ -47,18 +47,29 @@ def render_competition_queue(data_dir, interval, max_height):
             render_match_windows(windows, job["video_url"], f"queue_{selected}_{job['attempts']}")
         except (OSError, ValueError, TypeError, KeyError) as exc:
             st.warning(f"Could not read candidate match windows: {type(exc).__name__}")
-    if job["status"] == "completed":
+    if job["status"] in ("completed", "failed"):
         show_results()
     st.caption("Full recording; raw OCR defaults. Sampling and resolution use the sidebar settings.")
     confirm = st.checkbox("Confirm manual processing of this full recording", key=f"queue_confirm_{selected}")
     if st.button("Process selected job", disabled=not confirm or job["status"] != "pending" or job["attempts"] >= 5):
         bar = st.progress(0, text="Claiming job")
+        import pandas as pd
+        metrics = st.empty()
+        st.subheader("Live OCR results (latest 50 frames)")
+        raw_table = st.empty()
+        st.subheader("Live candidate match windows (provisional)")
+        window_table = st.empty()
+        def preview(rows, windows, stats):
+            metrics.json(stats)
+            raw_table.dataframe(pd.DataFrame(rows[-50:]), use_container_width=True)
+            window_table.dataframe(pd.DataFrame(windows), use_container_width=True,
+                column_config={"youtube_link": st.column_config.LinkColumn("YouTube link")})
         try:
             process_job(queue, job, data_dir, int(interval), int(max_height),
-                        lambda p, message: bar.progress(p, text=message))
+                        lambda p, message: bar.progress(p, text=message), preview)
             st.rerun()
         except Exception as exc:
-            st.error(f"Processing stopped: {type(exc).__name__}. Check local logs and refresh.")
+            st.error(f"Processing stopped: {type(exc).__name__}: {exc}")
     retry = st.checkbox("Confirm manual retry", key=f"queue_retry_{selected}")
     if st.button("Requeue failed job", disabled=not retry or job["status"] != "failed" or job["attempts"] >= 5):
         try:
