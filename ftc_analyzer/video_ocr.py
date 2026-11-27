@@ -307,94 +307,118 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
         return stabilize_team_numbers(results, schedule if enable_schedule else None, enable_voting=enable_voting)
     return results
 
+MATCH_WINDOW_VERSION = "2"
+
 def build_observed_match_windows(ocr_rows: list[dict], interval_seconds: int) -> list[dict]:
-    """Group scoreboard observations and backtrack from the stable teleop clock.
+    """Consolidate nearby observations using match identity and teleop anchors."""
+    from collections import Counter
+    from statistics import median
 
-    FTC match sequence used here:
-      * Autonomous: 2:30 down to 2:00 (30 seconds)
-      * Transition: 0:08 down to 0:00 (8 seconds)
-      * Teleop: 2:00 down to 0:00 (120 seconds)
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+    rows = sorted(ocr_rows, key=lambda r: r["timestamp_seconds"])
+    gap = max(60, 3 * interval_seconds)
 
-    The most reliable anchor is a frame around the 1:00 teleop mark where all
-    four team IDs are still visible. At that point elapsed match time is
-    30 + 8 + (120 - clock) = 158 - clock seconds.
-    """
-    windows = []
-    current = None
+    def identity(row):
+        text = row.get("ocr_text") or ""
+        phase = ("playoff" if re.search(r"\b(?:playoff|final|semifinal)\b", text, re.I)
+                 else "qualification" if re.search(r"\b(?:qualification|qualifying|qual)\b", text, re.I)
+                 else None)
+        return row.get("match_number_candidate"), phase
 
-    def finish(item):
-        if not item:
-            return
-        item["observed_until_seconds"] = item["last_seen_seconds"] + interval_seconds
-        item["first_seen"] = format_timestamp(item["first_seen_seconds"])
-        item["observed_until"] = format_timestamp(item["observed_until_seconds"])
-        estimates = item.pop("start_estimates", [])
-        if estimates:
-            estimates.sort()
-            middle = len(estimates) // 2
-            if len(estimates) % 2:
-                estimate = estimates[middle]
-            else:
-                estimate = (estimates[middle - 1] + estimates[middle]) / 2
-            item["estimated_start_seconds"] = max(0, round(estimate))
-            item["estimated_start"] = format_timestamp(item["estimated_start_seconds"])
-            item["start_offset_seconds"] = item["estimated_start_seconds"]
-            item["start_offset"] = format_timestamp(item["start_offset_seconds"])
-            item["start_estimate_samples"] = len(estimates)
-            item["boundary_note"] = (
-                "Backtracked from frames near the 1:00 teleop mark with all four "
-                "team IDs detected. Estimated offset = video timestamp - (158 - "
-                "displayed clock seconds)."
-            )
-        else:
-            item["estimated_start_seconds"] = None
-            item["estimated_start"] = None
-            item["start_offset_seconds"] = None
-            item["start_offset"] = None
-            item["start_estimate_samples"] = 0
-            item["boundary_note"] = (
-                "No qualifying frame near the 1:00 teleop mark with all four team "
-                "IDs detected; only the observed scoreboard window is available."
-            )
-        windows.append(item)
+    def teams(row):
+        return set(row.get("red_team_numbers") or []) | set(row.get("blue_team_numbers") or [])
 
-    for row in ocr_rows:
-        number = row.get("match_number_candidate")
-        if number is None:
-            finish(current)
-            current = None
-            continue
-
-        red = row.get("red_team_numbers") or []
-        blue = row.get("blue_team_numbers") or []
-        teams = row.get("team_number_candidates") or sorted(set(red + blue))
-        if current and current["match_number"] == number:
-            current["last_seen_seconds"] = row["timestamp_seconds"]
-            current["frames_seen"] += 1
-            current["team_numbers_seen"] = sorted(set(current["team_numbers_seen"]) | set(teams))
-        else:
-            finish(current)
-            current = {
-                "match_number": number,
-                "first_seen_seconds": row["timestamp_seconds"],
-                "last_seen_seconds": row["timestamp_seconds"],
-                "observed_until_seconds": row["timestamp_seconds"] + interval_seconds,
-                "frames_seen": 1,
-                "team_numbers_seen": teams,
-                "start_estimates": [],
-            }
-
+    def anchor(row):
         clock = row.get("match_clock_seconds")
-        # Only use the stable teleop section around one minute remaining.
-        # This avoids the ambiguous 2:00 reading at the auto/transition boundary.
-        all_four = len(red) == 2 and len(blue) == 2 and len(set(red + blue)) == 4
-        if clock is not None and 45 <= int(clock) <= 75 and all_four:
-            elapsed = 158 - int(clock)
-            current["start_estimates"].append(
-                float(row["timestamp_seconds"]) - elapsed
-            )
+        if clock is not None and 45 <= clock <= 75 and len(teams(row)) == 4:
+            return row["timestamp_seconds"] - (158 - clock)
+        return None
 
-    finish(current)
+    groups = []
+    for row in rows:
+        number, phase = identity(row)
+        if number is None:
+            continue
+        t = row["timestamp_seconds"]
+        estimate = anchor(row)
+        group = groups[-1] if groups else None
+        compatible = False
+        if group:
+            previous = group[-1]
+            pn, pp = identity(previous)
+            compatible = (number == pn and not (phase and pp and phase != pp)
+                          and t - previous["timestamp_seconds"] <= gap)
+            estimates = [anchor(x) for x in group if anchor(x) is not None]
+            if compatible and estimate is not None and estimates:
+                compatible = abs(estimate - median(estimates)) <= max(20, interval_seconds * 2)
+            if compatible and len(teams(row)) == len(teams(previous)) == 4:
+                compatible = len(teams(row) & teams(previous)) >= 2
+        if compatible:
+            group.append(row)
+        else:
+            groups.append([row])
+
+    # Bridge an isolated incorrect label between two compatible fragments.
+    i = 1
+    while i + 1 < len(groups):
+        left, middle, right = groups[i-1:i+2]
+        ln, lp = identity(left[-1])
+        rn, rp = identity(right[0])
+        if (len(middle) == 1 and anchor(middle[0]) is None and ln == rn
+                and not (lp and rp and lp != rp)
+                and right[0]["timestamp_seconds"] - left[-1]["timestamp_seconds"] <= gap
+                and len(teams(left[-1]) & teams(right[0])) >= 3):
+            left.extend(right)
+            del groups[i:i+2]
+        else:
+            i += 1
+
+    windows = []
+    for group in groups:
+        number = identity(group[0])[0]
+        phases = Counter(p for _, p in map(identity, group) if p)
+        phase = phases.most_common(1)[0][0] if phases else None
+        first, last = group[0]["timestamp_seconds"], group[-1]["timestamp_seconds"]
+        # Recover unlabeled observations inside the window only when teams agree.
+        votes = Counter(t for row in group for t in teams(row))
+        consensus = {t for t, _ in votes.most_common(4)}
+        recovered = [r for r in rows if first <= r["timestamp_seconds"] <= last
+                     and identity(r)[0] is None and len(teams(r) & consensus) >= 3]
+        observations = group + recovered
+        votes = Counter(t for row in observations for t in teams(row))
+        consensus = sorted(t for t, count in votes.most_common(4)
+                           if count * 2 >= len(observations))
+        estimates = [anchor(r) for r in observations if anchor(r) is not None
+                     and len(teams(r) & set(consensus)) >= 3]
+        center = median(estimates) if estimates else None
+        estimates = [e for e in estimates if abs(e-center) <= max(20, interval_seconds*2)]
+        start = max(0, round(median(estimates))) if estimates else None
+        clocks = sorted((r["timestamp_seconds"], r["match_clock_seconds"])
+                        for r in observations if r.get("match_clock_seconds") is not None)
+        moving = any(0 < c1-c2 and abs((c1-c2)-(t2-t1)) <= max(4, interval_seconds)
+                     for (t1,c1),(t2,c2) in zip(clocks, clocks[1:]))
+        review = start is None or len(consensus) != 4 or not moving
+        windows.append({
+            "match_number": number, "match_phase": phase,
+            "match_window_version": MATCH_WINDOW_VERSION,
+            "first_seen_seconds": first, "last_seen_seconds": last,
+            "observed_until_seconds": last + interval_seconds,
+            "first_seen": format_timestamp(first),
+            "observed_until": format_timestamp(last + interval_seconds),
+            "frames_seen": len(observations), "recovered_unlabeled_frames": len(recovered),
+            "team_numbers_seen": consensus,
+            "team_number_votes": dict(votes),
+            "estimated_start_seconds": start,
+            "estimated_start": format_timestamp(start) if start is not None else None,
+            "start_offset_seconds": start,
+            "start_offset": format_timestamp(start) if start is not None else None,
+            "start_estimate_samples": len(estimates),
+            "countdown_progression": moving,
+            "needs_review": review,
+            "boundary_note": ("Teleop consensus: timestamp - (158 - clock)."
+                              if start is not None else "No reliable teleop anchor; review required."),
+        })
     return windows
 
 def save_ocr_results(rows: list[dict], json_path: Path, csv_path: Path) -> None:
