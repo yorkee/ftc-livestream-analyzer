@@ -72,7 +72,8 @@ def _read_digits(crop: np.ndarray, roster: set[int] | None) -> tuple[int | None,
     gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(enlarged, cv2.COLOR_BGR2HSV)
     light = cv2.inRange(hsv, (0, 0, 145), (179, 110, 255))
-    variants = (gray, cv2.bitwise_not(light))
+    yellow = cv2.inRange(hsv, (20, 100, 150), (40, 255, 255))
+    variants = (gray, cv2.bitwise_not(cv2.bitwise_or(light, yellow)))
     attempts = []
     debug = []
     for variant_index, img in enumerate(variants):
@@ -107,7 +108,7 @@ def _read_digits(crop: np.ndarray, roster: set[int] | None) -> tuple[int | None,
 
 
 def live_boxes(frame):
-    """Discover white clock and paired team cells in the live scoreboard."""
+    """Discover white clock and paired white or yellow team cells."""
     if frame is None:
         return {}
     h, w = frame.shape[:2]
@@ -119,6 +120,14 @@ def live_boxes(frame):
     boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > w*h*.001]
     clocks = [(x,y,a,b) for x,y,a,b in boxes if abs(x+a/2-w/2)<w*.045
               and .07*w<a<.16*w and .10*h<b<.23*h and (y+b<h*.36 or y>h*.64)]
+    # Team cells may be yellow when a card is issued. Keep clock detection white-only.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, (20, 100, 150), (40, 255, 255))
+    yellow[int(h*.36):int(h*.64)] = 0
+    team_mask = cv2.morphologyEx(cv2.bitwise_or(mask, yellow), cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, round(w*.006)), max(2, round(h*.015)))))
+    team_contours, _ = cv2.findContours(team_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    team_boxes = [cv2.boundingRect(c) for c in team_contours if cv2.contourArea(c) > w*h*.001]
     # Score panels provide a boundary independent of the white field timer.
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     red_mask = ((hsv[:,:,0]<12)|(hsv[:,:,0]>165)) & (hsv[:,:,1]>105) & (hsv[:,:,2]>60)
@@ -150,7 +159,7 @@ def live_boxes(frame):
     for x,y,a,b in clocks:
         out = {"clock": (x,y,a,b)}
         for side in ("red", "blue"):
-            candidates = [(u,v,p,q) for u,v,p,q in boxes if .065*w<p<.19*w
+            candidates = [(u,v,p,q) for u,v,p,q in team_boxes if .065*w<p<.19*w
                           and .045*h<q<.14*h and y-.02*h<v<y+b
                           and v+q<y+b+.06*h and (u+p<x if side=="red" else u>x+a)]
             pairs = []
@@ -169,7 +178,7 @@ def live_boxes(frame):
             return out
     # Recover cells whose white contours merge into the camera footage.
     for x,y,a,b in clocks:
-        bounded = mask.copy()
+        bounded = team_mask.copy()
         bounded[:y] = 0
         bounded[y+b:] = 0
         contours, _ = cv2.findContours(bounded, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -201,7 +210,8 @@ def live_boxes(frame):
                     white = (crop[:,:,1]<65)&(crop[:,:,2]>=180)
                     digits = digit_crop(frame,slot,out[slot])
                     gray = cv2.cvtColor(digits,cv2.COLOR_BGR2GRAY)
-                    if white.mean()<.60 or not .025<(gray<100).mean()<.40:
+                    yellow_cell = (crop[:,:,0]>=20)&(crop[:,:,0]<=40)&(crop[:,:,1]>=100)&(crop[:,:,2]>=150)
+                    if (white | yellow_cell).mean()<.60 or not .025<(gray<100).mean()<.40:
                         valid = False
                         break
                 if valid:
