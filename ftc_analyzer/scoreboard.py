@@ -11,6 +11,25 @@ import numpy as np
 import pytesseract
 from pytesseract import Output
 
+import logging
+
+OCR_VERSION = "3"
+def safe_ocr(fn, image, errors, operation, **kwargs):
+    """Recover from native OCR failures without losing other observations."""
+    try:
+        return fn(image, timeout=15, **kwargs)
+    except pytesseract.TesseractNotFoundError:
+        raise
+    except (pytesseract.TesseractError, RuntimeError) as exc:
+        if not isinstance(exc, pytesseract.TesseractError) and "timeout" not in str(exc).lower():
+            raise
+        detail = {"operation": operation, "return_code": getattr(exc, "status", None),
+                  "error": str(exc), "config": kwargs.get("config")}
+        logging.getLogger(__name__).warning("OCR failure: %s", detail)
+        if errors is not None:
+            errors.append(detail)
+        return {"text": [], "conf": []} if kwargs.get("output_type") == Output.DICT else ""
+
 SLOTS = ("red1", "red2", "blue1", "blue2")
 
 
@@ -65,7 +84,7 @@ def detect_alliance_panels(frame: np.ndarray) -> dict[str, tuple[int, int, int, 
     return {"red": red_panel, "blue": blue_panel}
 
 
-def _read_digits(crop: np.ndarray, roster: set[int] | None) -> tuple[int | None, float, str]:
+def _read_digits(crop: np.ndarray, roster: set[int] | None, errors=None, slot="unknown") -> tuple[int | None, float, str]:
     if crop.size == 0:
         return None, 0., ""
     enlarged = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
@@ -81,8 +100,8 @@ def _read_digits(crop: np.ndarray, roster: set[int] | None) -> tuple[int | None,
             img, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255
         )
         for psm in (7, 8):
-            data = pytesseract.image_to_data(
-                padded, config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+            data = safe_ocr(pytesseract.image_to_data, padded, errors, f"{slot}:variant{variant_index}:psm{psm}",
+                config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
                 output_type=Output.DICT,
             )
             tokens = [str(t).strip() for t in data.get("text", []) if str(t).strip()]
@@ -236,7 +255,7 @@ def digit_crop(frame, slot, box):
     return frame[y+pad:y+h-pad,x+int(w*left):x+int(w*right)]
 
 
-def read_team_slots(frame, known_team_numbers=None):
+def read_team_slots(frame, known_team_numbers=None, errors=None):
     slots = dict.fromkeys(SLOTS)
     boxes = live_boxes(frame)
     if not boxes:
@@ -246,12 +265,12 @@ def read_team_slots(frame, known_team_numbers=None):
     for slot in SLOTS:
         crop = digit_crop(frame, slot, boxes[slot])
         enlarged = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        data = pytesseract.image_to_data(enlarged, config="--psm 7 -c tessedit_char_whitelist=0123456789", output_type=Output.DICT)
+        data = safe_ocr(pytesseract.image_to_data, enlarged, errors, f"{slot}:primary", config="--psm 7 -c tessedit_char_whitelist=0123456789", output_type=Output.DICT)
         token = "".join(t.strip() for t in data["text"] if t.strip())
         confidence = max((float(c) for c in data["conf"] if float(c)>=0), default=0.)
         value = int(token) if re.fullmatch(r"[1-9][0-9]{2,4}", token) else None
         if value is None or (roster is not None and value not in roster):
-            value, confidence, extra = _read_digits(crop, roster)
+            value, confidence, extra = _read_digits(crop, roster, errors, slot)
             token += " " + extra
         slots[slot] = value
         raw.append(f"{slot}: {token}")
