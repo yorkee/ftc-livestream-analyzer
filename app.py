@@ -16,7 +16,7 @@ from ftc_analyzer.scoreboard import live_boxes, digit_crop, read_team_slots, SLO
 from ftc_analyzer.frame_import import import_frame_folder
 from ftc_analyzer.video_ocr import (
     download_video, extract_frames, run_ocr, build_observed_match_windows,
-    save_ocr_results, format_timestamp, segment_key,
+    save_ocr_results, format_timestamp, segment_key, OCR_VERSION, stabilize_team_numbers,
 )
 
 load_dotenv()
@@ -293,6 +293,7 @@ with manual_tab:
                     st.write(raw)
                     st.caption(f"Mean OCR confidence: {confidence}")
 
+    restart_ocr = st.checkbox("Restart OCR instead of resuming checkpoint", value=False)
     if st.button("Run OCR on captured frames", disabled=not frame_rows):
         try:
             known_teams = None
@@ -309,7 +310,43 @@ with manual_tab:
             def update_progress(fraction, current, total):
                 progress.progress(fraction, text=f"Reading frame {current:,} of {total:,}...")
             with st.spinner("Running Tesseract OCR on each captured frame..."):
-                ocr_rows = run_ocr(frame_rows, known_teams, update_progress, schedule=schedule, enable_voting=vote_frames, enable_schedule=correct_schedule)
+                import hashlib
+                signature = hashlib.sha256(json.dumps({
+                    "version": OCR_VERSION,
+                    "frames": [(f, Path(f["frame_path"]).stat().st_mtime_ns) for f in frame_rows],
+                    "roster": sorted(known_teams or []),
+                }, sort_keys=True).encode()).hexdigest()[:24]
+                checkpoint = OCR_DIR / f"manual_{signature}.checkpoint.json"
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                raw_rows = json.loads(checkpoint.read_text()) if checkpoint.exists() and not restart_ocr else []
+                if restart_ocr:
+                    checkpoint.unlink(missing_ok=True)
+                if len(raw_rows) > len(frame_rows) or any(
+                    any(row.get(k) != v for k, v in frame.items())
+                    for row, frame in zip(raw_rows, frame_rows)
+                ):
+                    raise RuntimeError("OCR checkpoint does not match captured frames")
+                live_preview = st.empty()
+                def snapshot():
+                    tmp = checkpoint.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(raw_rows, indent=2), encoding="utf-8")
+                    tmp.replace(checkpoint)
+                    live_preview.dataframe(pd.DataFrame(raw_rows[-50:]).reindex(columns=[
+                        "timestamp", "scoreboard_format", "match_number_candidate",
+                        "match_clock", "team_number_candidates", "ocr_errors"
+                    ]), use_container_width=True)
+                    st.session_state.ocr_rows = list(raw_rows)
+                    st.session_state.match_windows = build_observed_match_windows(raw_rows, int(interval))
+                update_progress(len(raw_rows)/len(frame_rows), len(raw_rows), len(frame_rows))
+                for frame in frame_rows[len(raw_rows):]:
+                    raw_rows.extend(run_ocr([frame], known_teams, enable_voting=False, enable_schedule=False))
+                    update_progress(len(raw_rows)/len(frame_rows), len(raw_rows), len(frame_rows))
+                    if len(raw_rows) % 50 == 0 or len(raw_rows) == len(frame_rows):
+                        snapshot()
+                ocr_rows = json.loads(json.dumps(raw_rows))
+                if vote_frames or (correct_schedule and schedule):
+                    ocr_rows = stabilize_team_numbers(ocr_rows, schedule if correct_schedule else None, enable_voting=vote_frames)
+                live_preview.empty()
             st.session_state.ocr_rows = ocr_rows
             st.session_state.match_windows = build_observed_match_windows(ocr_rows, int(interval))
             export_key = f"{key}_{interval}s"
@@ -322,7 +359,7 @@ with manual_tab:
     if ocr_rows:
         st.subheader("OCR results")
         ocr_df = pd.DataFrame(ocr_rows)
-        display_columns = ["timestamp", "scoreboard_format", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr"]
+        display_columns = ["timestamp", "scoreboard_format", "match_number_candidate", "match_clock", "match_clock_confidence", "red_team_numbers", "blue_team_numbers", "team_slots", "team_number_source", "teams_complete", "ocr_confidence", "team_number_ocr_confidence", "team_number_candidates", "ocr_text", "team_number_ocr", "ocr_errors"]
         if show_raw:
             display_columns = ["frame_index", "team_slots_raw", "team_slots_filtered", "team_slots_voted"] + display_columns
         st.dataframe(ocr_df.reindex(columns=display_columns), use_container_width=True, height=420)
