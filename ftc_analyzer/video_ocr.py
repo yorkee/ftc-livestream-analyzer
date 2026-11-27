@@ -13,7 +13,7 @@ import pytesseract
 from PIL import Image
 from pytesseract import Output
 
-from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers, live_boxes
+from ftc_analyzer.scoreboard import read_team_slots, stabilize_team_numbers, live_boxes, safe_ocr, OCR_VERSION
 
 
 def segment_key(video_id: str, max_height: int, start_seconds: int = 0,
@@ -117,7 +117,7 @@ def format_timestamp(seconds: int | float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def _ocr_text(image_path: str) -> tuple[str, float]:
+def _ocr_text(image_path: str, errors=None) -> tuple[str, float]:
     """Read match/event text only from the top and bottom banner search bands."""
     image = Image.open(image_path).convert("RGB")
     width, height = image.size
@@ -131,7 +131,7 @@ def _ocr_text(image_path: str) -> tuple[str, float]:
         if crop.width < 1000:
             scale = 1000 / crop.width
             crop = crop.resize((1000, int(crop.height * scale)))
-        data = pytesseract.image_to_data(crop, config="--psm 11", output_type=Output.DICT)
+        data = safe_ocr(pytesseract.image_to_data, crop, errors, "match_text", config="--psm 11", output_type=Output.DICT)
         for word, conf in zip(data.get("text", []), data.get("conf", [])):
             word = word.strip()
             try:
@@ -175,19 +175,19 @@ def detect_team_numbers(text: str, known_team_numbers: Iterable[int] | None = No
 
 
 def _ocr_team_numbers_by_side(image_path: str,
-                              known_team_numbers: Iterable[int] | None = None
+                              known_team_numbers: Iterable[int] | None = None, errors=None
                               ) -> tuple[list[int], list[int], str, float, dict]:
     """Find colored scoreboard panels and OCR their four team slots."""
     image = cv2.imread(image_path)
     if image is None:
         return [], [], "could not open frame", 0.0, {}
-    slots, raw, confidence = read_team_slots(image, known_team_numbers)
+    slots, raw, confidence = read_team_slots(image, known_team_numbers, errors)
     red = [slots[key] for key in ("red1", "red2") if slots.get(key) is not None]
     blue = [slots[key] for key in ("blue1", "blue2") if slots.get(key) is not None]
     return red, blue, raw, confidence, slots
 
 
-def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
+def _ocr_match_clock(image_path: str, errors=None) -> tuple[str | None, int | None, float]:
     """Read the large mm:ss countdown in the center of the scoreboard banner."""
     import numpy as np
 
@@ -216,10 +216,12 @@ def _ocr_match_clock(image_path: str) -> tuple[str | None, int | None, float]:
             gray,
             cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
         ]
-        for processed in variants:
+        for variant_index, processed in enumerate(variants):
+            if int(processed.max()) - int(processed.min()) < 8:
+                continue
             for psm in (7, 8):
-                text = pytesseract.image_to_string(
-                    processed,
+                text = safe_ocr(pytesseract.image_to_string, processed, errors,
+                    f"match_clock:variant{variant_index}:psm{psm}",
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789:",
                 ).strip()
                 match = re.search(r"(?<!\d)(\d{1,2})\s*[:;.,]?\s*(\d{2})(?!\d)", text)
@@ -253,7 +255,7 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
     for index, frame in enumerate(frame_rows, start=1):
         boxes = live_boxes(cv2.imread(frame["frame_path"]))
         if not boxes:
-            results.append({**frame, "scoreboard_format": "skipped", "ocr_text": "",
+            results.append({**frame, "scoreboard_format": "skipped", "ocr_errors": [], "ocr_version": OCR_VERSION, "ocr_text": "",
                 "ocr_confidence": 0., "match_number_candidate": None, "match_clock": None,
                 "match_clock_seconds": None, "match_clock_confidence": 0.,
                 "red_team_numbers": [], "blue_team_numbers": [], "team_number_ocr": "non-live layout",
@@ -263,12 +265,13 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
             if progress_callback:
                 progress_callback(index / total, index, total)
             continue
-        text, confidence = _ocr_text(frame["frame_path"])
+        errors = []
+        text, confidence = _ocr_text(frame["frame_path"], errors)
         match_clock, match_clock_seconds, match_clock_confidence = _ocr_match_clock(
-            frame["frame_path"]
+            frame["frame_path"], errors
         )
         red_teams, blue_teams, team_raw, team_conf, team_slots = _ocr_team_numbers_by_side(
-            frame["frame_path"], None
+            frame["frame_path"], None, errors
         )
         raw_slots = team_slots.copy()
         if roster is not None:
@@ -279,6 +282,8 @@ def run_ocr(frame_rows: list[dict], known_team_numbers: Iterable[int] | None = N
         results.append({
             **frame,
             "scoreboard_format": "live",
+            "ocr_errors": errors,
+            "ocr_version": OCR_VERSION,
             "ocr_text": text,
             "ocr_confidence": confidence,
             "match_number_candidate": detect_match_number(text),
