@@ -112,7 +112,7 @@ def process_job(queue, selected, data_dir, interval=10, max_height=720,
     import time
     import traceback
     import pytesseract
-    from .video_ocr import download_video, extract_frames, run_ocr, build_observed_match_windows, save_ocr_results
+    from .video_ocr import download_video, extract_frames, run_ocr, build_observed_match_windows, save_ocr_results, OCR_VERSION
     video_id = selected.get("youtube_video_id") or ""
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ValueError("Job needs a valid normalized YouTube ID.")
@@ -138,12 +138,12 @@ def process_job(queue, selected, data_dir, interval=10, max_height=720,
         manifest = cache / "frames.json"
         frames = json.loads(manifest.read_text()) if manifest.exists() else []
         if not frames or not all(Path(f["frame_path"]).is_file() for f in frames):
-            checkpoint = cache / "checkpoint.json"
+            checkpoint = cache / f"checkpoint_ocr_v{OCR_VERSION}.json"
             checkpoint.unlink(missing_ok=True)
             frames = extract_frames(path, cache / "frames", interval, start_offset_seconds=0,
                                     duration_seconds=None)
             atomic(manifest, frames)
-        checkpoint = cache / "checkpoint.json"
+        checkpoint = cache / f"checkpoint_ocr_v{OCR_VERSION}.json"
         rows = json.loads(checkpoint.read_text()) if checkpoint.exists() else []
         if len(rows) > len(frames) or any(r["frame_index"] != f["frame_index"]
                                          for r, f in zip(rows, frames)):
@@ -163,9 +163,10 @@ def process_job(queue, selected, data_dir, interval=10, max_height=720,
                          youtube_video_id=video_id)
             atomic(root / "ocr/windows.json", windows)
             failed = sum(bool(r.get("ocr_error")) for r in rows)
+            partial_errors = sum(bool(r.get("ocr_errors")) for r in rows)
             speed = (len(rows) - initial) / max(time.monotonic() - started, 0.001)
             stats = {"processed": len(rows), "total": len(frames), "failed": failed,
-                     "successful": len(rows) - failed, "checkpoint": len(rows),
+                     "successful": len(rows) - failed, "frames_with_ocr_errors": partial_errors, "checkpoint": len(rows),
                      "frames_per_second": round(speed, 2),
                      "eta_seconds": round((len(frames) - len(rows)) / speed) if speed else None}
             preview(rows, windows, stats)
@@ -201,7 +202,7 @@ def process_job(queue, selected, data_dir, interval=10, max_height=720,
         windows, stats = snapshot()
         save_ocr_results(rows, root / "ocr/results.json", root / "ocr/results.csv")
         summary = {"frames": len(frames), "ocr_rows": len(rows), "candidate_windows": len(windows),
-                   "failed_frames": stats["failed"], "artifact_dir": str(root / "ocr"),
+                   "failed_frames": stats["failed"], "frames_with_ocr_errors": stats["frames_with_ocr_errors"], "ocr_version": OCR_VERSION, "artifact_dir": str(root / "ocr"),
                    "published": False, "interval_seconds": interval, "max_height": max_height}
         queue.finish(job, summary=summary)
         notify(100, "Completed; results saved locally")
